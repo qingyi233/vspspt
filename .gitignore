@@ -1,0 +1,44 @@
+# CAD/model inputs and generated geometry
+*.stp
+*.step
+*.stl
+*.vtk
+*.vti
+*.msh
+*.brep
+*.iges
+*.igs
+
+# Generated outputs
+output/
+stp_voxel_toolkit/output/
+**/output/
+
+# Python caches and temporary files
+__pycache__/
+*.pyc
+*.pyo
+*.pyo
+.pytest_cache/
+
+# C++/Visual Studio build outputs
+build/
+Debug/
+Release/
+x64/
+.vs/
+*.obj
+*.pdb
+*.ilk
+*.exp
+*.lib
+*.tlog
+
+# Local/editor files
+.vscode/
+.idea/
+*.log
+*.tmp
+*.pdf
+Thumbs.db
+desktop.ini
