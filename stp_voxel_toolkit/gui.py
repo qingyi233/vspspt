@@ -10,6 +10,7 @@ Pipeline:
 from __future__ import annotations
 
 import queue
+import os
 import shutil
 import sys
 import threading
@@ -22,6 +23,9 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
 import numpy as np
+
+from stl_surface_to_vgm import surface_stl_to_voxels
+from vtk_selection_to_vgm import read_occupancy, selected_voxels, write_vgm_stream
 
 
 ROOT = Path(__file__).resolve().parent
@@ -71,6 +75,13 @@ def parse_positive_int(text: str, field_name: str) -> int:
     if result <= 0:
         raise ValueError(f"{field_name}必须大于 0")
     return result
+
+
+def parse_vector3(text: str, field_name: str) -> tuple[float, float, float]:
+    values = [part for part in text.replace("，", ",").replace(" ", ",").split(",") if part]
+    if len(values) != 3:
+        raise ValueError(f"{field_name}必须是 3 个数字，例如 0,0,-1")
+    return float(values[0]), float(values[1]), float(values[2])
 
 
 def log_put(q: queue.Queue, message: str) -> None:
@@ -304,7 +315,13 @@ def write_surface_vtk(path: Path, grid: np.ndarray, origin, spacing, q: queue.Qu
     counts = [(direction, int(mask.sum())) for direction, mask in masks]
     face_count = sum(count for _, count in counts)
     point_count = face_count * 4
+    nx, ny, nz = grid.shape
     log_put(q, "表面面片: " + ", ".join(f"{d}={c:,}" for d, c in counts))
+
+    def write_int_scalar(f, name: str, values: np.ndarray) -> None:
+        f.write(f"SCALARS {name} int 1\nLOOKUP_TABLE default\n".encode("ascii"))
+        f.write(np.asarray(values, dtype=">i4").tobytes())
+        f.write(b"\n")
 
     with path.open("wb") as f:
         f.write(
@@ -343,6 +360,28 @@ def write_surface_vtk(path: Path, grid: np.ndarray, origin, spacing, q: queue.Qu
             f.write(np.full(n, 9, dtype=">i4").tobytes())
             remaining -= n
         f.write(b"\n")
+
+        voxel_i_parts = []
+        voxel_j_parts = []
+        voxel_k_parts = []
+        voxel_eid_parts = []
+        face_id_parts = []
+        for face_id, (_direction, mask) in enumerate(masks):
+            if not mask.any():
+                continue
+            i, j, k = np.nonzero(mask)
+            voxel_i_parts.append(i.astype(np.int32, copy=False))
+            voxel_j_parts.append(j.astype(np.int32, copy=False))
+            voxel_k_parts.append(k.astype(np.int32, copy=False))
+            voxel_eid_parts.append((1 + i + nx * j + nx * ny * k).astype(np.int32, copy=False))
+            face_id_parts.append(np.full(i.size, face_id, dtype=np.int32))
+
+        f.write(f"CELL_DATA {face_count}\n".encode("ascii"))
+        write_int_scalar(f, "voxel_i", np.concatenate(voxel_i_parts) if voxel_i_parts else np.empty(0, dtype=np.int32))
+        write_int_scalar(f, "voxel_j", np.concatenate(voxel_j_parts) if voxel_j_parts else np.empty(0, dtype=np.int32))
+        write_int_scalar(f, "voxel_k", np.concatenate(voxel_k_parts) if voxel_k_parts else np.empty(0, dtype=np.int32))
+        write_int_scalar(f, "voxel_eid", np.concatenate(voxel_eid_parts) if voxel_eid_parts else np.empty(0, dtype=np.int32))
+        write_int_scalar(f, "face_id", np.concatenate(face_id_parts) if face_id_parts else np.empty(0, dtype=np.int32))
     return face_count, point_count
 
 
@@ -408,6 +447,7 @@ def run_pipeline(config: RunConfig, q: queue.Queue) -> None:
         write_occupancy_vtk(occupancy_path, grid, mins, spacing)
         stage_put(q, "写出占据场 VTK", time.time() - start, f"{occupancy_path.name}, {occupancy_path.stat().st_size / 1048576:.2f} MB")
         log_put(q, f"占据场 VTK: {occupancy_path}")
+        q.put(("occupancy_path", str(occupancy_path)))
 
     if config.write_surface:
         start = time.time()
@@ -424,7 +464,7 @@ class VoxelGui(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
         self.title("STP/STL 体素化 VTK 转换工具")
-        self.geometry("980x720")
+        self.geometry("980x620")
         self.queue: queue.Queue = queue.Queue()
         self.worker: threading.Thread | None = None
         self.stage_rows: list[tuple[str, float, str]] = []
@@ -440,6 +480,19 @@ class VoxelGui(tk.Tk):
         self.use_cpp_var = tk.BooleanVar(value=True)
         self.write_occ_var = tk.BooleanVar(value=True)
         self.write_surface_var = tk.BooleanVar(value=True)
+        self.vgm_occ_var = tk.StringVar(value="")
+        self.vgm_constraint_var = tk.StringVar(value="")
+        self.vgm_load_var = tk.StringVar(value="")
+        self.vgm_output_var = tk.StringVar(value=str(ROOT / "output" / "model.vgm"))
+        self.vgm_fine_x_var = tk.StringVar(value="5")
+        self.vgm_fine_y_var = tk.StringVar(value="5")
+        self.vgm_fine_z_var = tk.StringVar(value="5")
+        self.vgm_spc_dof_var = tk.StringVar(value="123")
+        self.vgm_force_var = tk.StringVar(value="1000")
+        self.vgm_direction_var = tk.StringVar(value="0,0,-1")
+        self.vgm_workers_var = tk.StringVar(value=str(max(1, min(8, (os.cpu_count() or 2) // 2))))
+        self.vgm_spc_node_mode_var = tk.StringVar(value="命中粗单元8角点")
+        self.vgm_button: ttk.Button | None = None
 
         self._build_ui()
         self.after(100, self._poll_queue)
@@ -450,7 +503,30 @@ class VoxelGui(tk.Tk):
         main = ttk.Frame(self, padding=12)
         main.pack(fill="both", expand=True)
 
-        file_frame = ttk.LabelFrame(main, text="输入 / 输出", padding=10)
+        switch_frame = ttk.Frame(main)
+        switch_frame.pack(fill="x")
+        content_frame = ttk.Frame(main)
+        content_frame.pack(fill="x", pady=(4, 0))
+        voxel_tab = ttk.Frame(content_frame)
+        vgm_tab = ttk.Frame(content_frame)
+        self._tab_buttons: dict[str, ttk.Button] = {}
+
+        def show_tab(name: str) -> None:
+            voxel_tab.pack_forget()
+            vgm_tab.pack_forget()
+            if name == "voxel":
+                voxel_tab.pack(fill="x")
+            else:
+                vgm_tab.pack(fill="x")
+            self._tab_buttons["voxel"].configure(state="disabled" if name == "voxel" else "normal")
+            self._tab_buttons["vgm"].configure(state="disabled" if name == "vgm" else "normal")
+
+        self._tab_buttons["voxel"] = ttk.Button(switch_frame, text="体素化生成 VTK", command=lambda: show_tab("voxel"))
+        self._tab_buttons["vgm"] = ttk.Button(switch_frame, text="选区生成 VGM", command=lambda: show_tab("vgm"))
+        self._tab_buttons["voxel"].pack(side="left")
+        self._tab_buttons["vgm"].pack(side="left", padx=(6, 0))
+
+        file_frame = ttk.LabelFrame(voxel_tab, text="输入 / 输出", padding=10)
         file_frame.pack(fill="x")
 
         ttk.Label(file_frame, text="STEP/STP/STL 文件").grid(row=0, column=0, sticky="w")
@@ -462,7 +538,7 @@ class VoxelGui(tk.Tk):
         ttk.Button(file_frame, text="浏览", command=self._browse_out).grid(row=1, column=2, pady=(8, 0))
         file_frame.columnconfigure(1, weight=1)
 
-        opt_frame = ttk.LabelFrame(main, text="体素化设置", padding=10)
+        opt_frame = ttk.LabelFrame(voxel_tab, text="体素化设置", padding=10)
         opt_frame.pack(fill="x", pady=(10, 0))
 
         ttk.Label(opt_frame, text="目标总体素数").grid(row=0, column=0, sticky="w")
@@ -482,16 +558,14 @@ class VoxelGui(tk.Tk):
         ttk.Checkbutton(check_frame, text="写出占据场 VTK", variable=self.write_occ_var).pack(side="left", padx=(0, 18))
         ttk.Checkbutton(check_frame, text="写出可视表面 VTK", variable=self.write_surface_var).pack(side="left")
 
-        run_frame = ttk.Frame(main)
+        run_frame = ttk.Frame(voxel_tab)
         run_frame.pack(fill="x", pady=(10, 0))
         self.run_button = ttk.Button(run_frame, text="开始转换", command=self._start)
         self.run_button.pack(side="left")
-        self.status_var = tk.StringVar(value="就绪")
-        ttk.Label(run_frame, textvariable=self.status_var).pack(side="left", padx=12)
 
-        table_frame = ttk.LabelFrame(main, text="耗时分析", padding=10)
+        table_frame = ttk.LabelFrame(voxel_tab, text="耗时分析", padding=10)
         table_frame.pack(fill="x", pady=(10, 0))
-        self.tree = ttk.Treeview(table_frame, columns=("stage", "seconds", "percent", "cumulative", "detail"), show="headings", height=8)
+        self.tree = ttk.Treeview(table_frame, columns=("stage", "seconds", "percent", "cumulative", "detail"), show="headings", height=6)
         self.tree.heading("stage", text="模块")
         self.tree.heading("seconds", text="耗时/秒")
         self.tree.heading("percent", text="占比")
@@ -504,13 +578,73 @@ class VoxelGui(tk.Tk):
         self.tree.column("detail", width=520, anchor="w")
         self.tree.pack(fill="x")
 
+        vgm_frame = ttk.LabelFrame(vgm_tab, text="ParaView 选区生成 VGM", padding=10)
+        vgm_frame.pack(fill="x")
+
+        ttk.Label(vgm_frame, text="占据场 VTK").grid(row=0, column=0, sticky="w")
+        ttk.Entry(vgm_frame, textvariable=self.vgm_occ_var).grid(row=0, column=1, sticky="ew", padx=6)
+        ttk.Button(vgm_frame, text="浏览", command=self._browse_vgm_occ).grid(row=0, column=2)
+
+        ttk.Label(vgm_frame, text="约束 VTK/STL").grid(row=1, column=0, sticky="w", pady=(6, 0))
+        ttk.Entry(vgm_frame, textvariable=self.vgm_constraint_var).grid(row=1, column=1, sticky="ew", padx=6, pady=(6, 0))
+        ttk.Button(vgm_frame, text="浏览", command=self._browse_vgm_constraint).grid(row=1, column=2, pady=(6, 0))
+
+        ttk.Label(vgm_frame, text="载荷 VTK/STL").grid(row=2, column=0, sticky="w", pady=(6, 0))
+        ttk.Entry(vgm_frame, textvariable=self.vgm_load_var).grid(row=2, column=1, sticky="ew", padx=6, pady=(6, 0))
+        ttk.Button(vgm_frame, text="浏览", command=self._browse_vgm_load).grid(row=2, column=2, pady=(6, 0))
+
+        ttk.Label(vgm_frame, text="输出 VGM").grid(row=3, column=0, sticky="w", pady=(6, 0))
+        ttk.Entry(vgm_frame, textvariable=self.vgm_output_var).grid(row=3, column=1, sticky="ew", padx=6, pady=(6, 0))
+        ttk.Button(vgm_frame, text="浏览", command=self._browse_vgm_output).grid(row=3, column=2, pady=(6, 0))
+
+        param_frame = ttk.Frame(vgm_frame)
+        param_frame.grid(row=4, column=0, columnspan=3, sticky="w", pady=(8, 0))
+        ttk.Label(param_frame, text="细分 X").pack(side="left")
+        ttk.Entry(param_frame, textvariable=self.vgm_fine_x_var, width=5).pack(side="left", padx=(6, 8))
+        ttk.Label(param_frame, text="Y").pack(side="left")
+        ttk.Entry(param_frame, textvariable=self.vgm_fine_y_var, width=5).pack(side="left", padx=(6, 8))
+        ttk.Label(param_frame, text="Z").pack(side="left")
+        ttk.Entry(param_frame, textvariable=self.vgm_fine_z_var, width=5).pack(side="left", padx=(6, 16))
+        ttk.Label(param_frame, text="约束自由度").pack(side="left")
+        ttk.Entry(param_frame, textvariable=self.vgm_spc_dof_var, width=8).pack(side="left", padx=(6, 16))
+        ttk.Label(param_frame, text="力大小").pack(side="left")
+        ttk.Entry(param_frame, textvariable=self.vgm_force_var, width=10).pack(side="left", padx=(6, 16))
+        ttk.Label(param_frame, text="方向").pack(side="left")
+        ttk.Entry(param_frame, textvariable=self.vgm_direction_var, width=12).pack(side="left", padx=(6, 16))
+        ttk.Label(param_frame, text="并行线程").pack(side="left")
+        ttk.Entry(param_frame, textvariable=self.vgm_workers_var, width=5).pack(side="left", padx=(6, 16))
+        self.vgm_button = ttk.Button(param_frame, text="生成 VGM", command=self._start_vgm)
+        self.vgm_button.pack(side="left")
+        vgm_frame.columnconfigure(1, weight=1)
+
+        spc_mode_frame = ttk.Frame(vgm_frame)
+        spc_mode_frame.grid(row=5, column=0, columnspan=3, sticky="w", pady=(8, 0))
+        ttk.Label(spc_mode_frame, text="SPC粗节点映射").pack(side="left")
+        ttk.Combobox(
+            spc_mode_frame,
+            textvariable=self.vgm_spc_node_mode_var,
+            values=("命中粗单元8角点", "命中粗单元最小角点"),
+            width=18,
+            state="readonly",
+        ).pack(side="left", padx=(6, 16))
+
+        vgm_help = ttk.Label(vgm_frame, text="占据场必须选择 occupancy VTK；约束/载荷可以选择选区 VTK 或 UG 提取面的 STL。默认每个 VGM 粗单元包含 5x5x5 个细体素。", foreground="#555555")
+        vgm_help.grid(row=6, column=0, columnspan=3, sticky="w", pady=(8, 0))
+
+        self.status_var = tk.StringVar(value="就绪")
+        status_frame = ttk.Frame(main)
+        status_frame.pack(fill="x", pady=(10, 0))
+        ttk.Label(status_frame, text="状态").pack(side="left")
+        ttk.Label(status_frame, textvariable=self.status_var).pack(side="left", padx=8)
+
         log_frame = ttk.LabelFrame(main, text="日志", padding=10)
         log_frame.pack(fill="both", expand=True, pady=(10, 0))
-        self.log_text = tk.Text(log_frame, height=16, wrap="word")
+        self.log_text = tk.Text(log_frame, height=10, wrap="word")
         self.log_text.pack(side="left", fill="both", expand=True)
         scrollbar = ttk.Scrollbar(log_frame, command=self.log_text.yview)
         scrollbar.pack(side="right", fill="y")
         self.log_text.configure(yscrollcommand=scrollbar.set)
+        show_tab("voxel")
 
     def _browse_step(self) -> None:
         path = filedialog.askopenfilename(filetypes=[("CAD/网格文件", "*.stp *.step *.stl"), ("STEP 文件", "*.stp *.step"), ("STL 文件", "*.stl"), ("所有文件", "*.*")])
@@ -521,6 +655,26 @@ class VoxelGui(tk.Tk):
         path = filedialog.askdirectory()
         if path:
             self.out_var.set(path)
+
+    def _browse_vgm_occ(self) -> None:
+        path = filedialog.askopenfilename(filetypes=[("VTK 文件", "*.vtk"), ("所有文件", "*.*")])
+        if path:
+            self.vgm_occ_var.set(path)
+
+    def _browse_vgm_constraint(self) -> None:
+        path = filedialog.askopenfilename(filetypes=[("VTK/STL 文件", "*.vtk *.stl"), ("VTK 文件", "*.vtk"), ("STL 文件", "*.stl"), ("所有文件", "*.*")])
+        if path:
+            self.vgm_constraint_var.set(path)
+
+    def _browse_vgm_load(self) -> None:
+        path = filedialog.askopenfilename(filetypes=[("VTK/STL 文件", "*.vtk *.stl"), ("VTK 文件", "*.vtk"), ("STL 文件", "*.stl"), ("所有文件", "*.*")])
+        if path:
+            self.vgm_load_var.set(path)
+
+    def _browse_vgm_output(self) -> None:
+        path = filedialog.asksaveasfilename(defaultextension=".vgm", filetypes=[("VGM 文件", "*.vgm"), ("所有文件", "*.*")])
+        if path:
+            self.vgm_output_var.set(path)
 
     def _parse_config(self) -> RunConfig:
         step = Path(self.step_var.get())
@@ -576,6 +730,178 @@ class VoxelGui(tk.Tk):
         self.worker = threading.Thread(target=self._run_worker, args=(config,), daemon=True)
         self.worker.start()
 
+    def _parse_vgm_config(self) -> dict[str, object]:
+        occupancy = Path(self.vgm_occ_var.get())
+        constraint = Path(self.vgm_constraint_var.get())
+        load = Path(self.vgm_load_var.get())
+        output = Path(self.vgm_output_var.get())
+        if not occupancy.exists():
+            raise ValueError("占据场 VTK 不存在")
+        if not constraint.exists():
+            raise ValueError("约束 VTK/STL 不存在")
+        if not load.exists():
+            raise ValueError("载荷 VTK/STL 不存在")
+        if occupancy.suffix.lower() != ".vtk":
+            raise ValueError("占据场必须选择 *_occupancy_*.vtk")
+        if "_surface_" in occupancy.name.lower():
+            raise ValueError("占据场不能选择 surface VTK，请选择同一批生成的 *_occupancy_*.vtk")
+        if constraint.suffix.lower() not in {".vtk", ".stl"}:
+            raise ValueError("约束文件必须是 ParaView 选区 .vtk 或曲面 .stl")
+        if load.suffix.lower() not in {".vtk", ".stl"}:
+            raise ValueError("载荷文件必须是 ParaView 选区 .vtk 或曲面 .stl")
+        if not output.name:
+            raise ValueError("请设置输出 VGM 文件")
+
+        fine = (
+            parse_positive_int(self.vgm_fine_x_var.get(), "细分 X"),
+            parse_positive_int(self.vgm_fine_y_var.get(), "细分 Y"),
+            parse_positive_int(self.vgm_fine_z_var.get(), "细分 Z"),
+        )
+        if fine == (1, 1, 1):
+            answer = messagebox.askyesno(
+                "确认细分设置",
+                "当前细分为 1 1 1，会把每个 VTK 体素都写成 VGM 粗体素。\n"
+                "一亿体素会生成非常大的 VGM，写出时间也会很长。\n\n"
+                "是否继续？\n\n建议改为 5 5 5。",
+            )
+            if not answer:
+                raise ValueError("已取消生成。请把细分改为 5 5 5 后再试。")
+        force = float(self.vgm_force_var.get().strip())
+        direction = parse_vector3(self.vgm_direction_var.get(), "力方向")
+        workers = parse_positive_int(self.vgm_workers_var.get(), "并行线程")
+        spc_node_mode_label = self.vgm_spc_node_mode_var.get()
+        spc_node_mode = {
+            "命中粗单元8角点": "cell-corners",
+            "命中粗单元最小角点": "cell-min-corner",
+        }.get(spc_node_mode_label)
+        if spc_node_mode is None:
+            raise ValueError("SPC粗节点映射选项无效")
+        spc_dof = self.vgm_spc_dof_var.get().strip()
+        if not spc_dof:
+            raise ValueError("约束自由度不能为空")
+        return {
+            "occupancy": occupancy,
+            "constraint": constraint,
+            "load": load,
+            "output": output,
+            "fine": fine,
+            "force": force,
+            "direction": direction,
+            "workers": workers,
+            "spc_node_mode": spc_node_mode,
+            "spc_dof": spc_dof,
+        }
+
+    def _start_vgm(self) -> None:
+        if self.worker and self.worker.is_alive():
+            messagebox.showwarning("正在运行", "当前已有任务在运行，请等待完成。")
+            return
+        try:
+            config = self._parse_vgm_config()
+        except Exception as exc:
+            messagebox.showerror("参数错误", str(exc))
+            return
+
+        if self.vgm_button is not None:
+            self.vgm_button.configure(state="disabled")
+        self.run_button.configure(state="disabled")
+        self.status_var.set("正在生成 VGM...")
+        self.worker = threading.Thread(target=self._run_vgm_worker, args=(config,), daemon=True)
+        self.worker.start()
+
+    def _run_vgm_worker(self, config: dict[str, object]) -> None:
+        try:
+            start = time.time()
+            occupancy_path = config["occupancy"]
+            constraint_path = config["constraint"]
+            load_path = config["load"]
+            output_path = config["output"]
+            fine = config["fine"]
+            workers = int(config["workers"])
+            spc_node_mode = str(config["spc_node_mode"])
+
+            self.queue.put(("status", "正在读取占据场 VTK..."))
+            log_put(self.queue, f"读取占据场 VTK: {occupancy_path}")
+            occupancy, origin, spacing = read_occupancy(occupancy_path)
+            dims = occupancy.shape
+            log_put(self.queue, f"体素尺寸: {dims[0]} x {dims[1]} x {dims[2]}")
+
+            log_put(self.queue, f"读取约束选区 VTK: {constraint_path}")
+            if constraint_path.suffix.lower() == ".stl":
+                tolerance = (spacing[0] ** 2 + spacing[1] ** 2 + spacing[2] ** 2) ** 0.5
+                log_put(self.queue, f"约束文件是 STL，按曲面距离映射体素，容差: {tolerance:.9g}，并行线程: {workers}")
+                self.queue.put(("status", "正在映射约束 STL..."))
+
+                def constraint_progress(done, total, selected):
+                    log_put(self.queue, f"约束 STL 进度: {done:,}/{total:,} 个三角面，当前命中 {selected:,} 个体素")
+
+                constraint_voxels = surface_stl_to_voxels(
+                    constraint_path,
+                    occupancy,
+                    origin,
+                    spacing,
+                    tolerance,
+                    progress=constraint_progress,
+                    workers=workers,
+                )
+            else:
+                self.queue.put(("status", "正在读取约束选区 VTK..."))
+                constraint_voxels = selected_voxels(constraint_path, dims)
+            log_put(self.queue, f"约束选中体素: {len(constraint_voxels):,}")
+
+            log_put(self.queue, f"读取载荷选区 VTK: {load_path}")
+            if load_path.suffix.lower() == ".stl":
+                tolerance = (spacing[0] ** 2 + spacing[1] ** 2 + spacing[2] ** 2) ** 0.5
+                log_put(self.queue, f"载荷文件是 STL，按曲面距离映射体素，容差: {tolerance:.9g}，并行线程: {workers}")
+                self.queue.put(("status", "正在映射载荷 STL..."))
+
+                def load_progress(done, total, selected):
+                    log_put(self.queue, f"载荷 STL 进度: {done:,}/{total:,} 个三角面，当前命中 {selected:,} 个体素")
+
+                load_voxels = surface_stl_to_voxels(
+                    load_path,
+                    occupancy,
+                    origin,
+                    spacing,
+                    tolerance,
+                    progress=load_progress,
+                    workers=workers,
+                )
+            else:
+                self.queue.put(("status", "正在读取载荷选区 VTK..."))
+                load_voxels = selected_voxels(load_path, dims)
+            log_put(self.queue, f"载荷选中体素: {len(load_voxels):,}")
+
+            self.queue.put(("status", "正在写出 VGM..."))
+            log_put(self.queue, "开始流式写出 VGM...")
+
+            def write_progress(stage, done, total):
+                log_put(self.queue, f"写出 {stage}: {done:,}/{total:,}")
+
+            write_vgm_stream(
+                output_path,
+                occupancy,
+                origin,
+                spacing,
+                constraint_voxels,
+                load_voxels,
+                fine,
+                str(config["spc_dof"]),
+                1,
+                float(config["force"]),
+                config["direction"],
+                1,
+                "Voxel VGM from selected STL surfaces",
+                progress=write_progress,
+                spc_node_mode=spc_node_mode,
+            )
+            seconds = time.time() - start
+            log_put(self.queue, f"VGM 输出: {output_path}")
+            log_put(self.queue, f"VGM 文件大小: {output_path.stat().st_size / 1048576:.2f} MB")
+            self.queue.put(("vgm_done", seconds, str(output_path)))
+        except Exception:
+            self.queue.put(("error", traceback.format_exc(), None))
+
     def _run_worker(self, config: RunConfig) -> None:
         try:
             run_pipeline(config, self.queue)
@@ -592,6 +918,8 @@ class VoxelGui(tk.Tk):
                 if kind == "log":
                     self.log_text.insert("end", item[1] + "\n")
                     self.log_text.see("end")
+                elif kind == "status":
+                    self.status_var.set(item[1])
                 elif kind == "stage":
                     _kind, stage, seconds, detail = item
                     self.stage_rows.append((stage, seconds, detail))
@@ -600,10 +928,26 @@ class VoxelGui(tk.Tk):
                     self._refresh_time_table(final=True)
                     self.status_var.set("已完成")
                     self.run_button.configure(state="normal")
+                    if self.vgm_button is not None:
+                        self.vgm_button.configure(state="normal")
                     messagebox.showinfo("完成", "转换完成。")
+                elif kind == "vgm_done":
+                    _kind, seconds, output_path = item
+                    self.status_var.set("VGM 已完成")
+                    self.run_button.configure(state="normal")
+                    if self.vgm_button is not None:
+                        self.vgm_button.configure(state="normal")
+                    self.log_text.insert("end", f"生成 VGM 耗时: {seconds:.3f} 秒\n")
+                    self.log_text.see("end")
+                    messagebox.showinfo("完成", f"VGM 生成完成:\n{output_path}")
+                elif kind == "occupancy_path":
+                    if not self.vgm_occ_var.get().strip():
+                        self.vgm_occ_var.set(item[1])
                 elif kind == "error":
                     self.status_var.set("失败")
                     self.run_button.configure(state="normal")
+                    if self.vgm_button is not None:
+                        self.vgm_button.configure(state="normal")
                     self.log_text.insert("end", item[1] + "\n")
                     if len(item) > 2 and item[2]:
                         self.log_text.insert("end", "\n详细调试信息:\n" + item[2] + "\n")

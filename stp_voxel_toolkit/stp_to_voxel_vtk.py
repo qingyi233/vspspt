@@ -229,6 +229,13 @@ def write_surface_vtk(path: Path, grid: np.ndarray, origin, spacing) -> tuple[in
     masks = boundary_masks(grid)
     face_count = sum(int(mask.sum()) for _, mask in masks)
     point_count = face_count * 4
+    nx, ny, nz = grid.shape
+
+    def write_int_scalar(f, name: str, values: np.ndarray) -> None:
+        f.write(f"SCALARS {name} int 1\nLOOKUP_TABLE default\n".encode("ascii"))
+        f.write(np.asarray(values, dtype=">i4").tobytes())
+        f.write(b"\n")
+
     with path.open("wb") as f:
         f.write((
             "# vtk DataFile Version 3.0\n"
@@ -261,6 +268,28 @@ def write_surface_vtk(path: Path, grid: np.ndarray, origin, spacing) -> tuple[in
             f.write(np.full(n, 9, dtype=">i4").tobytes())
             remaining -= n
         f.write(b"\n")
+
+        voxel_i_parts = []
+        voxel_j_parts = []
+        voxel_k_parts = []
+        voxel_eid_parts = []
+        face_id_parts = []
+        for face_id, (_direction, mask) in enumerate(masks):
+            if not mask.any():
+                continue
+            i, j, k = np.nonzero(mask)
+            voxel_i_parts.append(i.astype(np.int32, copy=False))
+            voxel_j_parts.append(j.astype(np.int32, copy=False))
+            voxel_k_parts.append(k.astype(np.int32, copy=False))
+            voxel_eid_parts.append((1 + i + nx * j + nx * ny * k).astype(np.int32, copy=False))
+            face_id_parts.append(np.full(i.size, face_id, dtype=np.int32))
+
+        f.write(f"CELL_DATA {face_count}\n".encode("ascii"))
+        write_int_scalar(f, "voxel_i", np.concatenate(voxel_i_parts) if voxel_i_parts else np.empty(0, dtype=np.int32))
+        write_int_scalar(f, "voxel_j", np.concatenate(voxel_j_parts) if voxel_j_parts else np.empty(0, dtype=np.int32))
+        write_int_scalar(f, "voxel_k", np.concatenate(voxel_k_parts) if voxel_k_parts else np.empty(0, dtype=np.int32))
+        write_int_scalar(f, "voxel_eid", np.concatenate(voxel_eid_parts) if voxel_eid_parts else np.empty(0, dtype=np.int32))
+        write_int_scalar(f, "face_id", np.concatenate(face_id_parts) if face_id_parts else np.empty(0, dtype=np.int32))
     return face_count, point_count
 
 
