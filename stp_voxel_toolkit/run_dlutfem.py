@@ -13,7 +13,9 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parent
-DEFAULT_SOLVER_BIN = ROOT.parent / "FEM" / "pimlfem" / "Artifact" / "Mingw-w64-gcc13.2" / "bin"
+LOCAL_SOLVER_BIN = ROOT / "solver_bin"
+REPO_SOLVER_BIN = ROOT.parent / "FEM" / "pimlfem" / "Artifact" / "Mingw-w64-gcc13.2" / "bin"
+DEFAULT_SOLVER_BIN = LOCAL_SOLVER_BIN if (LOCAL_SOLVER_BIN / "DLUTFEM.exe").exists() else REPO_SOLVER_BIN
 DEFAULT_WORK_ROOT = Path(r"C:\temp\dlutfem_ascii")
 
 

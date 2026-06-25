@@ -11,12 +11,14 @@
 *.brep
 *.iges
 *.igs
+*.prt
 
 # Generated outputs
 output/
 stp_voxel_toolkit/output/
 **/output/
 FEM/
+dist/
 
 # Python caches and temporary files
 __pycache__/

@@ -23,6 +23,8 @@ cd "D:\File\Project\Section\体素化代码\stp_voxel_toolkit"
 python -m pip install numpy gmsh joblib pybind11
 ```
 
+如果使用发布压缩包，解压后先双击 `run_stp_voxel_toolkit.bat`。机器上需要已有 Python，并安装上面的依赖。压缩包内如果带有 `solver_bin\DLUTFEM.exe`，GUI 的有限元求解页会自动使用它。
+
 ## GUI 使用
 
 ```powershell
