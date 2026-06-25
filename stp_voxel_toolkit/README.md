@@ -27,6 +27,8 @@ python -m pip install numpy gmsh joblib pybind11
 
 如果使用便携版压缩包 `stp_voxel_toolkit_portable.zip`，解压后直接双击 `run_stp_voxel_toolkit.bat`。便携版自带 Python、numpy、gmsh、joblib、体素化运行库和 `solver_bin\DLUTFEM.exe`，不需要在对方电脑安装 Python。
 
+如果给外部用户分发，优先使用安装器 `STPVoxelToolkit_Setup.exe`：双击后会安装到当前用户的 `%LOCALAPPDATA%\STPVoxelToolkit`，并创建桌面和开始菜单快捷方式，不需要管理员权限。
+
 ## GUI 使用
 
 ```powershell

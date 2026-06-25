@@ -1,4 +1,3 @@
 @echo off
 cd /d "%~dp0"
-python gui.py
-pause
+start "" "%~dp0python\pythonw.exe" "%~dp0gui.py"
