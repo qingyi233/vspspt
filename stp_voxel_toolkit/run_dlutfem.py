@@ -88,6 +88,7 @@ def run_dlutfem(
     output_dir: Path,
     job: str | None,
     refresh_bin: bool,
+    log=print,
 ) -> int:
     vgm_path = vgm_path.resolve()
     solver_bin = solver_bin.resolve()
@@ -106,10 +107,10 @@ def run_dlutfem(
     runtime_bin = work_root / "bin"
     run_dir = work_root / "run" / job_name
 
-    print(f"[1/5] 准备求解器运行库: {runtime_bin}")
+    log(f"[1/5] 准备求解器运行库: {runtime_bin}")
     copy_solver_runtime(solver_bin, runtime_bin, refresh=refresh_bin)
 
-    print(f"[2/5] 准备英文运行目录: {run_dir}")
+    log(f"[2/5] 准备英文运行目录: {run_dir}")
     clear_directory(run_dir)
     input_vgm = run_dir / "input.vgm"
     shutil.copy2(vgm_path, input_vgm)
@@ -119,10 +120,10 @@ def run_dlutfem(
     env = os.environ.copy()
     env["PATH"] = str(runtime_bin) + os.pathsep + env.get("PATH", "")
 
-    print("[3/5] 开始计算:")
-    print(" ".join(f'"{part}"' if " " in part else part for part in cmd))
+    log("[3/5] 开始计算:")
+    log(" ".join(f'"{part}"' if " " in part else part for part in cmd))
     start = time.time()
-    process = subprocess.run(
+    process = subprocess.Popen(
         cmd,
         cwd=runtime_bin,
         env=env,
@@ -132,20 +133,26 @@ def run_dlutfem(
         encoding="utf-8",
         errors="replace",
     )
+    output_lines: list[str] = []
+    assert process.stdout is not None
+    for line in process.stdout:
+        text = line.rstrip("\r\n")
+        output_lines.append(text)
+        log(text)
+    returncode = process.wait()
     seconds = time.time() - start
 
     log_path = run_dir / f"{job_name}.dlutfem.log"
-    log_path.write_text(process.stdout, encoding="utf-8", errors="replace")
-    print(process.stdout.rstrip())
-    print(f"[4/5] 计算耗时: {seconds:.3f} 秒，返回码: {process.returncode}")
+    log_path.write_text("\n".join(output_lines) + "\n", encoding="utf-8", errors="replace")
+    log(f"[4/5] 计算耗时: {seconds:.3f} 秒，返回码: {returncode}")
 
-    print(f"[5/5] 回拷结果到: {output_dir}")
+    log(f"[5/5] 回拷结果到: {output_dir}")
     copied = copy_outputs(run_dir, output_dir, job_name)
     for path in copied:
-        print(f"  {path}")
-    if process.returncode != 0:
-        print(f"DLUTFEM 返回非零状态，日志已保存: {output_dir / log_path.name}", file=sys.stderr)
-    return process.returncode
+        log(f"  {path}")
+    if returncode != 0:
+        log(f"DLUTFEM 返回非零状态，日志已保存: {output_dir / log_path.name}")
+    return returncode
 
 
 def main() -> None:

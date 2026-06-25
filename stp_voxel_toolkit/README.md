@@ -36,7 +36,13 @@ python gui.py
 - 勾选 `Write surface VTK`，这个文件能在 ParaView 中直接看到结构。
 - 勾选 `Reuse STL`，第二次运行会跳过 STEP 转 STL，速度明显更快。
 
-GUI 会显示各模块耗时、占比和累计时间。
+GUI 现在有三个分页：
+
+- `体素化生成 VTK`：把 STP/STEP/STL 转成体素 VTK。
+- `选区生成 VGM`：用 occupancy VTK 加两个选区 VTK/STL 生成 VGM。
+- `VGM 有限元求解`：调用 `DLUTFEM.exe` 计算 VGM，并把结果 `.h5/.vtk/.db/.log` 回拷到指定目录。
+
+体素化页会显示各模块耗时、占比和累计时间；VGM 生成和有限元求解会在日志窗口持续输出状态。
 
 ## 命令行使用
 

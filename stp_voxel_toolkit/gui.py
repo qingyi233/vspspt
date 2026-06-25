@@ -26,6 +26,7 @@ import numpy as np
 
 from stl_surface_to_vgm import surface_stl_to_voxels
 from vtk_selection_to_vgm import read_occupancy, selected_voxels, write_vgm_stream
+from run_dlutfem import DEFAULT_SOLVER_BIN, DEFAULT_WORK_ROOT, run_dlutfem, safe_job_name
 
 
 ROOT = Path(__file__).resolve().parent
@@ -493,6 +494,13 @@ class VoxelGui(tk.Tk):
         self.vgm_workers_var = tk.StringVar(value=str(max(1, min(8, (os.cpu_count() or 2) // 2))))
         self.vgm_spc_node_mode_var = tk.StringVar(value="命中粗单元8角点")
         self.vgm_button: ttk.Button | None = None
+        self.solve_vgm_var = tk.StringVar(value="")
+        self.solve_out_var = tk.StringVar(value=str(ROOT / "output" / "dlutfem_result"))
+        self.solve_job_var = tk.StringVar(value="")
+        self.solve_solver_bin_var = tk.StringVar(value=str(DEFAULT_SOLVER_BIN))
+        self.solve_work_root_var = tk.StringVar(value=str(DEFAULT_WORK_ROOT))
+        self.solve_refresh_bin_var = tk.BooleanVar(value=False)
+        self.solve_button: ttk.Button | None = None
 
         self._build_ui()
         self.after(100, self._poll_queue)
@@ -509,22 +517,29 @@ class VoxelGui(tk.Tk):
         content_frame.pack(fill="x", pady=(4, 0))
         voxel_tab = ttk.Frame(content_frame)
         vgm_tab = ttk.Frame(content_frame)
+        solve_tab = ttk.Frame(content_frame)
         self._tab_buttons: dict[str, ttk.Button] = {}
 
         def show_tab(name: str) -> None:
             voxel_tab.pack_forget()
             vgm_tab.pack_forget()
+            solve_tab.pack_forget()
             if name == "voxel":
                 voxel_tab.pack(fill="x")
-            else:
+            elif name == "vgm":
                 vgm_tab.pack(fill="x")
+            else:
+                solve_tab.pack(fill="x")
             self._tab_buttons["voxel"].configure(state="disabled" if name == "voxel" else "normal")
             self._tab_buttons["vgm"].configure(state="disabled" if name == "vgm" else "normal")
+            self._tab_buttons["solve"].configure(state="disabled" if name == "solve" else "normal")
 
         self._tab_buttons["voxel"] = ttk.Button(switch_frame, text="体素化生成 VTK", command=lambda: show_tab("voxel"))
         self._tab_buttons["vgm"] = ttk.Button(switch_frame, text="选区生成 VGM", command=lambda: show_tab("vgm"))
+        self._tab_buttons["solve"] = ttk.Button(switch_frame, text="VGM 有限元求解", command=lambda: show_tab("solve"))
         self._tab_buttons["voxel"].pack(side="left")
         self._tab_buttons["vgm"].pack(side="left", padx=(6, 0))
+        self._tab_buttons["solve"].pack(side="left", padx=(6, 0))
 
         file_frame = ttk.LabelFrame(voxel_tab, text="输入 / 输出", padding=10)
         file_frame.pack(fill="x")
@@ -631,6 +646,38 @@ class VoxelGui(tk.Tk):
         vgm_help = ttk.Label(vgm_frame, text="占据场必须选择 occupancy VTK；约束/载荷可以选择选区 VTK 或 UG 提取面的 STL。默认每个 VGM 粗单元包含 5x5x5 个细体素。", foreground="#555555")
         vgm_help.grid(row=6, column=0, columnspan=3, sticky="w", pady=(8, 0))
 
+        solve_frame = ttk.LabelFrame(solve_tab, text="DLUTFEM 求解 VGM", padding=10)
+        solve_frame.pack(fill="x")
+
+        ttk.Label(solve_frame, text="输入 VGM").grid(row=0, column=0, sticky="w")
+        ttk.Entry(solve_frame, textvariable=self.solve_vgm_var).grid(row=0, column=1, sticky="ew", padx=6)
+        ttk.Button(solve_frame, text="浏览", command=self._browse_solve_vgm).grid(row=0, column=2)
+
+        ttk.Label(solve_frame, text="结果输出目录").grid(row=1, column=0, sticky="w", pady=(6, 0))
+        ttk.Entry(solve_frame, textvariable=self.solve_out_var).grid(row=1, column=1, sticky="ew", padx=6, pady=(6, 0))
+        ttk.Button(solve_frame, text="浏览", command=self._browse_solve_out).grid(row=1, column=2, pady=(6, 0))
+
+        ttk.Label(solve_frame, text="Job 名称").grid(row=2, column=0, sticky="w", pady=(6, 0))
+        ttk.Entry(solve_frame, textvariable=self.solve_job_var, width=24).grid(row=2, column=1, sticky="w", padx=6, pady=(6, 0))
+
+        ttk.Label(solve_frame, text="求解器 bin 目录").grid(row=3, column=0, sticky="w", pady=(6, 0))
+        ttk.Entry(solve_frame, textvariable=self.solve_solver_bin_var).grid(row=3, column=1, sticky="ew", padx=6, pady=(6, 0))
+        ttk.Button(solve_frame, text="浏览", command=self._browse_solve_bin).grid(row=3, column=2, pady=(6, 0))
+
+        ttk.Label(solve_frame, text="英文临时目录").grid(row=4, column=0, sticky="w", pady=(6, 0))
+        ttk.Entry(solve_frame, textvariable=self.solve_work_root_var).grid(row=4, column=1, sticky="ew", padx=6, pady=(6, 0))
+        ttk.Button(solve_frame, text="浏览", command=self._browse_solve_work_root).grid(row=4, column=2, pady=(6, 0))
+
+        solve_options = ttk.Frame(solve_frame)
+        solve_options.grid(row=5, column=0, columnspan=3, sticky="w", pady=(10, 0))
+        ttk.Checkbutton(solve_options, text="重新复制求解器运行库", variable=self.solve_refresh_bin_var).pack(side="left", padx=(0, 16))
+        self.solve_button = ttk.Button(solve_options, text="开始求解", command=self._start_solve)
+        self.solve_button.pack(side="left")
+
+        solve_help = ttk.Label(solve_frame, text="求解时会把 VGM 和 DLUTFEM 临时复制到纯英文路径运行，避免中文路径导致求解器崩溃。结果会回拷到上面的输出目录。", foreground="#555555")
+        solve_help.grid(row=6, column=0, columnspan=3, sticky="w", pady=(8, 0))
+        solve_frame.columnconfigure(1, weight=1)
+
         self.status_var = tk.StringVar(value="就绪")
         status_frame = ttk.Frame(main)
         status_frame.pack(fill="x", pady=(10, 0))
@@ -675,6 +722,34 @@ class VoxelGui(tk.Tk):
         path = filedialog.asksaveasfilename(defaultextension=".vgm", filetypes=[("VGM 文件", "*.vgm"), ("所有文件", "*.*")])
         if path:
             self.vgm_output_var.set(path)
+            if not self.solve_vgm_var.get().strip():
+                self.solve_vgm_var.set(path)
+            if not self.solve_job_var.get().strip():
+                self.solve_job_var.set(safe_job_name(Path(path).stem))
+
+    def _browse_solve_vgm(self) -> None:
+        path = filedialog.askopenfilename(filetypes=[("VGM 文件", "*.vgm"), ("所有文件", "*.*")])
+        if path:
+            self.solve_vgm_var.set(path)
+            if not self.solve_job_var.get().strip():
+                self.solve_job_var.set(safe_job_name(Path(path).stem))
+            if self.solve_out_var.get().strip() == str(ROOT / "output" / "dlutfem_result"):
+                self.solve_out_var.set(str(Path(path).parent / "dlutfem_result"))
+
+    def _browse_solve_out(self) -> None:
+        path = filedialog.askdirectory()
+        if path:
+            self.solve_out_var.set(path)
+
+    def _browse_solve_bin(self) -> None:
+        path = filedialog.askdirectory()
+        if path:
+            self.solve_solver_bin_var.set(path)
+
+    def _browse_solve_work_root(self) -> None:
+        path = filedialog.askdirectory()
+        if path:
+            self.solve_work_root_var.set(path)
 
     def _parse_config(self) -> RunConfig:
         step = Path(self.step_var.get())
@@ -725,7 +800,7 @@ class VoxelGui(tk.Tk):
         self.tree.delete(*self.tree.get_children())
         self.stage_rows.clear()
         self.log_text.delete("1.0", "end")
-        self.run_button.configure(state="disabled")
+        self._set_task_buttons("disabled")
         self.status_var.set("运行中...")
         self.worker = threading.Thread(target=self._run_worker, args=(config,), daemon=True)
         self.worker.start()
@@ -802,11 +877,50 @@ class VoxelGui(tk.Tk):
             messagebox.showerror("参数错误", str(exc))
             return
 
-        if self.vgm_button is not None:
-            self.vgm_button.configure(state="disabled")
-        self.run_button.configure(state="disabled")
+        self._set_task_buttons("disabled")
         self.status_var.set("正在生成 VGM...")
         self.worker = threading.Thread(target=self._run_vgm_worker, args=(config,), daemon=True)
+        self.worker.start()
+
+    def _parse_solve_config(self) -> dict[str, object]:
+        vgm_path = Path(self.solve_vgm_var.get())
+        output_dir = Path(self.solve_out_var.get())
+        solver_bin = Path(self.solve_solver_bin_var.get())
+        work_root = Path(self.solve_work_root_var.get())
+        job = self.solve_job_var.get().strip() or safe_job_name(vgm_path.stem)
+        if not vgm_path.exists():
+            raise ValueError("输入 VGM 不存在")
+        if vgm_path.suffix.lower() != ".vgm":
+            raise ValueError("输入文件必须是 .vgm")
+        if not (solver_bin / "DLUTFEM.exe").exists():
+            raise ValueError("求解器 bin 目录中找不到 DLUTFEM.exe")
+        try:
+            str(work_root).encode("ascii")
+        except UnicodeEncodeError as exc:
+            raise ValueError("英文临时目录不能包含中文或其他非 ASCII 字符") from exc
+        return {
+            "vgm": vgm_path,
+            "output_dir": output_dir,
+            "solver_bin": solver_bin,
+            "work_root": work_root,
+            "job": job,
+            "refresh_bin": self.solve_refresh_bin_var.get(),
+        }
+
+    def _start_solve(self) -> None:
+        if self.worker and self.worker.is_alive():
+            messagebox.showwarning("正在运行", "当前已有任务在运行，请等待完成。")
+            return
+        try:
+            config = self._parse_solve_config()
+        except Exception as exc:
+            messagebox.showerror("参数错误", str(exc))
+            return
+
+        self.log_text.delete("1.0", "end")
+        self._set_task_buttons("disabled")
+        self.status_var.set("正在求解 VGM...")
+        self.worker = threading.Thread(target=self._run_solve_worker, args=(config,), daemon=True)
         self.worker.start()
 
     def _run_vgm_worker(self, config: dict[str, object]) -> None:
@@ -898,7 +1012,31 @@ class VoxelGui(tk.Tk):
             seconds = time.time() - start
             log_put(self.queue, f"VGM 输出: {output_path}")
             log_put(self.queue, f"VGM 文件大小: {output_path.stat().st_size / 1048576:.2f} MB")
+            if not self.solve_vgm_var.get().strip():
+                self.queue.put(("solve_vgm_path", str(output_path)))
             self.queue.put(("vgm_done", seconds, str(output_path)))
+        except Exception:
+            self.queue.put(("error", traceback.format_exc(), None))
+
+    def _run_solve_worker(self, config: dict[str, object]) -> None:
+        try:
+            start = time.time()
+
+            def log_callback(message: str) -> None:
+                if message:
+                    log_put(self.queue, message)
+
+            returncode = run_dlutfem(
+                config["vgm"],
+                config["solver_bin"],
+                config["work_root"],
+                config["output_dir"],
+                config["job"],
+                bool(config["refresh_bin"]),
+                log=log_callback,
+            )
+            seconds = time.time() - start
+            self.queue.put(("solve_done", seconds, returncode, str(config["output_dir"])))
         except Exception:
             self.queue.put(("error", traceback.format_exc(), None))
 
@@ -909,6 +1047,13 @@ class VoxelGui(tk.Tk):
             self.queue.put(("error", str(exc), traceback.format_exc()))
         except Exception:
             self.queue.put(("error", traceback.format_exc(), None))
+
+    def _set_task_buttons(self, state: str) -> None:
+        self.run_button.configure(state=state)
+        if self.vgm_button is not None:
+            self.vgm_button.configure(state=state)
+        if self.solve_button is not None:
+            self.solve_button.configure(state=state)
 
     def _poll_queue(self) -> None:
         try:
@@ -927,27 +1072,38 @@ class VoxelGui(tk.Tk):
                 elif kind == "done":
                     self._refresh_time_table(final=True)
                     self.status_var.set("已完成")
-                    self.run_button.configure(state="normal")
-                    if self.vgm_button is not None:
-                        self.vgm_button.configure(state="normal")
+                    self._set_task_buttons("normal")
                     messagebox.showinfo("完成", "转换完成。")
                 elif kind == "vgm_done":
                     _kind, seconds, output_path = item
                     self.status_var.set("VGM 已完成")
-                    self.run_button.configure(state="normal")
-                    if self.vgm_button is not None:
-                        self.vgm_button.configure(state="normal")
+                    self._set_task_buttons("normal")
                     self.log_text.insert("end", f"生成 VGM 耗时: {seconds:.3f} 秒\n")
                     self.log_text.see("end")
                     messagebox.showinfo("完成", f"VGM 生成完成:\n{output_path}")
                 elif kind == "occupancy_path":
                     if not self.vgm_occ_var.get().strip():
                         self.vgm_occ_var.set(item[1])
+                elif kind == "solve_vgm_path":
+                    self.solve_vgm_var.set(item[1])
+                    if not self.solve_job_var.get().strip():
+                        self.solve_job_var.set(safe_job_name(Path(item[1]).stem))
+                elif kind == "solve_done":
+                    _kind, seconds, returncode, output_dir = item
+                    self._set_task_buttons("normal")
+                    if returncode == 0:
+                        self.status_var.set("求解已完成")
+                        self.log_text.insert("end", f"求解耗时: {seconds:.3f} 秒\n")
+                        self.log_text.see("end")
+                        messagebox.showinfo("完成", f"求解完成，结果目录:\n{output_dir}")
+                    else:
+                        self.status_var.set("求解失败")
+                        self.log_text.insert("end", f"求解失败，返回码: {returncode}，耗时: {seconds:.3f} 秒\n")
+                        self.log_text.see("end")
+                        messagebox.showerror("求解失败", f"DLUTFEM 返回码: {returncode}\n请查看日志输出。")
                 elif kind == "error":
                     self.status_var.set("失败")
-                    self.run_button.configure(state="normal")
-                    if self.vgm_button is not None:
-                        self.vgm_button.configure(state="normal")
+                    self._set_task_buttons("normal")
                     self.log_text.insert("end", item[1] + "\n")
                     if len(item) > 2 and item[2]:
                         self.log_text.insert("end", "\n详细调试信息:\n" + item[2] + "\n")
