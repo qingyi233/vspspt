@@ -21,6 +21,7 @@ FEM/
 dist/
 
 # Python caches and temporary files
+.venv/
 __pycache__/
 *.pyc
 *.pyo

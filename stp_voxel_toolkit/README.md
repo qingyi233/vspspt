@@ -18,10 +18,18 @@
 
 ## 先安装依赖
 
+源码版要求 **64 位 Python 3.14**。仓库自带的 `cvoxelise.pyd` 是为 Python 3.14 编译的，不能由 Python 3.12/3.13 加载。
+
+首次使用时，直接双击项目根目录的 `setup_env.bat`。它会创建根目录下的 `.venv`、升级 pip、安装依赖并验证 C++ 体素化扩展。
+
+也可以在 PowerShell 中手动执行：
+
 ```powershell
-cd "D:\File\Project\Section\体素化代码\stp_voxel_toolkit"
-python -m pip install numpy gmsh joblib pybind11
+py -3.14 -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r stp_voxel_toolkit\requirements.txt
 ```
+
+安装依赖后双击 `stp_voxel_toolkit\run_gui.bat`。启动脚本会优先使用根目录的 `.venv`，环境不存在或不完整时会自动调用一键安装脚本。
 
 如果使用源码版压缩包，解压后先安装上面的 Python 依赖，再双击 `run_stp_voxel_toolkit.bat`。
 
@@ -32,7 +40,7 @@ python -m pip install numpy gmsh joblib pybind11
 ## GUI 使用
 
 ```powershell
-python gui.py
+..\.venv\Scripts\python.exe gui.py
 ```
 
 建议设置：
