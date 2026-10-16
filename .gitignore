@@ -1,3 +1,7 @@
+# Large local model datasets
+/10亿模型/
+/十亿模型/
+
 # CAD/model inputs and generated geometry
 *.stp
 *.step
