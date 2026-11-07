@@ -20,6 +20,8 @@ from typing import BinaryIO
 
 import numpy as np
 
+from vgm_stats import format_statistics, mesh_statistics, save_statistics
+
 
 FINE_PRESETS = {"555": (5, 5, 5), "101010": (10, 10, 10)}
 
@@ -443,8 +445,8 @@ def build_vgm(
         f"TITLE = {title}",
         "SUBCASE 1",
         "   SUBTITLE=ParaView selections",
-        "   SPC = 2",
-        f"   LOAD = {force_sid + 20}",
+        *(["   SPC = 2"] if constraint_voxels else []),
+        *([f"   LOAD = {force_sid + 20}"] if load_voxels else []),
         "   DISPLACEMENT(SORT1,REAL)=ALL",
         "   SPCFORCES(SORT1,REAL)=ALL",
         "   STRESS(SORT1,REAL,VONMISES,BILIN)=ALL",
@@ -466,8 +468,8 @@ def build_vgm(
     lines.extend(scalar_line("MAT1", [material_id, "2.1E+11", "8.1E+10", "0.3", "7800."], 8))
 
     constraint_nodes = constraint_coarse_nodes(constraint_voxels, fine, (cnx, cny, cnz), spc_node_mode)
-    lines.extend(scalar_line("SPCADD", [2, 1], 8))
     if constraint_nodes:
+        lines.extend(scalar_line("SPCADD", [2, 1], 8))
         lines.extend(scalar_line("SPC1", [1, spc_dof, *sorted(constraint_nodes)], 8))
     else:
         lines.append("$ No constraint selection was provided.")
@@ -484,7 +486,8 @@ def build_vgm(
         mask = load_map.setdefault(eid, np.zeros(fine_count, dtype=np.uint8))
         mask[local] = 1
     load_sid = force_sid + 20
-    lines.extend(scalar_line("LOAD", [load_sid, "1.0", "1.0", force_sid], 8))
+    if load_map:
+        lines.extend(scalar_line("LOAD", [load_sid, "1.0", "1.0", force_sid], 8))
     header = [
         force_sid,
         0,
@@ -494,7 +497,8 @@ def build_vgm(
         bdf_real(force_direction[2]),
         len(load_map),
     ]
-    lines.extend(scalar_line("FORCE", header, 8))
+    if load_map:
+        lines.extend(scalar_line("FORCE", header, 8))
     for eid in sorted(load_map):
         lines.extend(eid_vector_lines("", eid, load_map[eid].astype(int).tolist()))
     lines.append("ENDDATA")
@@ -517,7 +521,7 @@ def write_vgm_stream(
     title: str,
     progress=None,
     spc_node_mode: str = "cell-corners",
-) -> None:
+) -> dict:
     nx, ny, nz = occupancy.shape
     fx, fy, fz = validate_fine(fine)
     cnx = math.ceil(nx / fx)
@@ -555,8 +559,8 @@ def write_vgm_stream(
                 f"TITLE = {title}",
                 "SUBCASE 1",
                 "   SUBTITLE=Generated boundary conditions",
-                "   SPC = 2",
-                f"   LOAD = {force_sid + 20}",
+                *(["   SPC = 2"] if constraint_nodes else []),
+                *([f"   LOAD = {force_sid + 20}"] if load_map else []),
                 "   DISPLACEMENT(SORT1,REAL)=ALL",
                 "   SPCFORCES(SORT1,REAL)=ALL",
                 "   STRESS(SORT1,REAL,VONMISES,BILIN)=ALL",
@@ -581,8 +585,8 @@ def write_vgm_stream(
                         progress("COARSE", processed, total_coarse)
 
         write_lines(f, scalar_line("MAT1", [material_id, "2.1E+11", "8.1E+10", "0.3", "7800."], 8))
-        write_lines(f, scalar_line("SPCADD", [2, 1], 8))
         if constraint_nodes:
+            write_lines(f, scalar_line("SPCADD", [2, 1], 8))
             write_lines(f, scalar_line("SPC1", [1, spc_dof, *sorted(constraint_nodes)], 8))
         else:
             write_lines(f, ["$ No constraint selection was provided."])
@@ -594,7 +598,8 @@ def write_vgm_stream(
                 progress("MATB", index, total_matb)
 
         load_sid = force_sid + 20
-        write_lines(f, scalar_line("LOAD", [load_sid, "1.0", "1.0", force_sid], 8))
+        if load_map:
+            write_lines(f, scalar_line("LOAD", [load_sid, "1.0", "1.0", force_sid], 8))
         header = [
             force_sid,
             0,
@@ -604,13 +609,24 @@ def write_vgm_stream(
             bdf_real(force_direction[2]),
             len(load_map),
         ]
-        write_lines(f, scalar_line("FORCE", header, 8))
+        if load_map:
+            write_lines(f, scalar_line("FORCE", header, 8))
         total_load = len(load_map)
         for index, eid in enumerate(sorted(load_map), 1):
             write_lines(f, eid_vector_lines("", eid, load_map[eid].astype(int).tolist()))
             if progress is not None and (index % 5_000 == 0 or index == total_load):
                 progress("FORCE", index, total_load)
         write_lines(f, ["ENDDATA"])
+
+    if progress is not None:
+        progress("STATS", 0, 1)
+    matb_records.clear()
+    del padded
+    stats = mesh_statistics(occupancy, (fx, fy, fz), origin, spacing, constraint_nodes, spc_dof)
+    save_statistics(output_path, stats)
+    if progress is not None:
+        progress("STATS", 1, 1)
+    return stats
 
 
 def vector3(text: str) -> tuple[float, float, float]:
@@ -621,10 +637,10 @@ def vector3(text: str) -> tuple[float, float, float]:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Convert voxel VTK and two ParaView selection VTKs to VGM.")
+    parser = argparse.ArgumentParser(description="Convert occupancy VTK to VGM with optional boundary selections.")
     parser.add_argument("--occupancy", required=True, type=Path, help="Original *_occupancy_*.vtk file.")
-    parser.add_argument("--constraint-selection", required=True, type=Path, help="ParaView Extract Selection VTK for constraints.")
-    parser.add_argument("--load-selection", required=True, type=Path, help="ParaView Extract Selection VTK for loads.")
+    parser.add_argument("--constraint-selection", type=Path, help="Optional ParaView Extract Selection VTK for constraints.")
+    parser.add_argument("--load-selection", type=Path, help="Optional ParaView Extract Selection VTK for loads.")
     parser.add_argument("--output", required=True, type=Path)
     add_fine_arguments(parser)
     parser.add_argument("--spc-dof", default="123", help="SPC1 constrained DOF, e.g. 123.")
@@ -640,12 +656,12 @@ def main() -> None:
 
     occupancy, origin, spacing = read_occupancy(args.occupancy)
     dims = occupancy.shape
-    constraint_voxels = selected_voxels(args.constraint_selection, dims)
-    load_voxels = selected_voxels(args.load_selection, dims)
+    constraint_voxels = selected_voxels(args.constraint_selection, dims) if args.constraint_selection else set()
+    load_voxels = selected_voxels(args.load_selection, dims) if args.load_selection else set()
     def progress(stage, done, total):
         print(f"{stage}: {done:,}/{total:,}")
 
-    write_vgm_stream(
+    stats = write_vgm_stream(
         args.output,
         occupancy,
         origin,
@@ -663,6 +679,8 @@ def main() -> None:
         spc_node_mode=args.spc_node_mode,
     )
     print(f"Wrote {args.output}")
+    print(format_statistics(stats))
+    print(f"Statistics: {args.output.with_suffix('.stats.json')}")
     print(f"Grid: {dims[0]}x{dims[1]}x{dims[2]}, fine={fine[0]}x{fine[1]}x{fine[2]}")
     print(f"Constraint selected voxels: {len(constraint_voxels):,}")
     print(f"Load selected voxels: {len(load_voxels):,}")

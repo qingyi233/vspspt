@@ -18,15 +18,17 @@ PYBIND11_MODULE(cvoxelise, m) {
         .def_readonly("nod_coor", &Voxel::nod_coor)
         .def_readonly("nod_coor_abs", &Voxel::nod_coor_abs)
         .def("initSize", &Voxel::initSize, "init size of X,Y Z")
-        .def("VOXELISE", py::overload_cast<std::string, std::string, bool>(&Voxel::VOXELISE),
+        .def("VOXELISE", py::overload_cast<std::string, std::string, bool, py::object>(&Voxel::VOXELISE),
             pybind11::arg("filename"),
             pybind11::arg("raydirection") = "xyz",
             pybind11::arg("parallel") = true,
+            pybind11::arg("bounds") = py::none(),
             "VOXELISE a stl model")
-        .def("VOXELISE", py::overload_cast<py::array_t<double>, std::string, bool>(&Voxel::VOXELISE),
+        .def("VOXELISE", py::overload_cast<py::array_t<double>, std::string, bool, py::object>(&Voxel::VOXELISE),
             pybind11::arg("mesh"),
             pybind11::arg("raydirection") = "xyz",
             pybind11::arg("parallel") = true,
+            pybind11::arg("bounds") = py::none(),
             "VOXELISE a stl model")
         .def("gen_vox_info", &Voxel::gen_vox_info, "gen_vox_info of voxelgrid")
         .def("save_mesh",&Voxel::save_mesh, "Save voxel mesh to inp_file");

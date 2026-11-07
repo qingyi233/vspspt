@@ -20,6 +20,10 @@ from tempfile import TemporaryDirectory
 
 import numpy as np
 
+from voxel_grid import add_box_arguments, mesh_bounds, resolve_grid
+from vtk_selection_to_vgm import add_fine_arguments, resolve_fine, write_vgm_stream
+from vgm_stats import format_statistics
+
 
 ROOT = Path(__file__).resolve().parent
 RUNTIME_DIR = ROOT / "pyvoxel_runtime"
@@ -147,15 +151,7 @@ def step_to_stl(step_path: Path, stl_path: Path, mesh_size: float | None) -> int
 
 
 def grid_for_mesh(mesh_vertices: np.ndarray, target_cells: int, longest_resolution: int | None) -> tuple[int, int, int]:
-    spans = np.array([mesh_vertices[:, axis, :].max() - mesh_vertices[:, axis, :].min() for axis in range(3)], dtype=float)
-    max_span = float(spans.max())
-    if longest_resolution is not None:
-        dims = np.maximum(2, np.rint(longest_resolution * spans / max_span).astype(int))
-    else:
-        ratio = float(np.prod(spans / max_span))
-        base = (target_cells / ratio) ** (1.0 / 3.0)
-        dims = np.maximum(2, np.rint(base * spans / max_span).astype(int))
-    return int(dims[0]), int(dims[1]), int(dims[2])
+    return resolve_grid(mesh_vertices, target_cells, longest_resolution)[0]
 
 
 def write_occupancy_vtk(path: Path, occupancy: np.ndarray, origin, spacing) -> None:
@@ -316,21 +312,24 @@ def run(args: argparse.Namespace) -> list[Stage]:
 
     start = time.perf_counter()
     mesh_vertices = pvoxel.Read_stl(str(stl_path))[0]
-    mins = tuple(float(mesh_vertices[:, axis, :].min()) for axis in range(3))
-    maxs = tuple(float(mesh_vertices[:, axis, :].max()) for axis in range(3))
-    spans = tuple(maxs[i] - mins[i] for i in range(3))
-    nx, ny, nz = grid_for_mesh(mesh_vertices, args.target_cells, args.resolution)
+    box_origin, box_size = getattr(args, "box_origin", None), getattr(args, "box_size", None)
+    (nx, ny, nz), mins, spacing = resolve_grid(
+        mesh_vertices, args.target_cells, args.resolution, box_origin, box_size,
+        fine=(getattr(args, "fine", None) or (5, 5, 5)) if getattr(args, "vgm", None) else None)
+    maxs = mesh_bounds(mesh_vertices)[1] if box_size is None else np.asarray(mins) + box_size
+    bounds = np.array([mins, maxs])
+    print(f"Box origin: {mins}, size: {tuple(bounds[1] - bounds[0])}, spacing: {spacing}")
     total_cells = nx * ny * nz
     stages.append(Stage("Read STL / Grid", time.perf_counter() - start, f"{mesh_vertices.shape[0]:,} triangles, grid {nx}x{ny}x{nz}={total_cells:,}"))
 
     start = time.perf_counter()
     if args.python:
         vox_obj = pvoxel.Voxel(nx, ny, nz)
-        grid = vox_obj.VOXELISE(mesh_vertices, ray=args.ray, parallel=False)
+        grid = vox_obj.VOXELISE(mesh_vertices, ray=args.ray, parallel=False, bounds=bounds)
         backend = "Python"
     else:
         vox_obj = voxel.Voxel(nx, ny, nz)
-        grid = vox_obj.VOXELISE(mesh_vertices, ray=args.ray, parallel=False)
+        grid = vox_obj.VOXELISE(mesh_vertices, ray=args.ray, parallel=False, bounds=bounds)
         backend = "C++"
     grid = np.asarray(grid, dtype=np.uint8)
     if grid.ndim == 4:
@@ -339,18 +338,27 @@ def run(args: argparse.Namespace) -> list[Stage]:
     stages.append(Stage("Voxelize", time.perf_counter() - start, f"{backend}, occupied {occupied:,}, fill {occupied / total_cells:.8f}"))
 
     suffix = f"r{args.resolution}" if args.resolution else f"target{args.target_cells}"
-    spacing = tuple(spans[i] / max(1, [nx, ny, nz][i]) for i in range(3))
 
     occupancy_path = out_dir / f"{input_path.stem}_occupancy_{suffix}_{nx}x{ny}x{nz}.vtk"
-    start = time.perf_counter()
-    write_occupancy_vtk(occupancy_path, grid, mins, spacing)
-    stages.append(Stage("Write Occupancy VTK", time.perf_counter() - start, f"{occupancy_path.name}, {occupancy_path.stat().st_size / 1048576:.2f} MB"))
+    if not getattr(args, "no_occupancy", False):
+        start = time.perf_counter()
+        write_occupancy_vtk(occupancy_path, grid, mins, spacing)
+        stages.append(Stage("Write Occupancy VTK", time.perf_counter() - start, f"{occupancy_path.name}, {occupancy_path.stat().st_size / 1048576:.2f} MB"))
 
     if args.surface:
         surface_path = out_dir / f"{input_path.stem}_surface_{suffix}_{nx}x{ny}x{nz}.vtk"
         start = time.perf_counter()
         face_count, point_count = write_surface_vtk(surface_path, grid, mins, spacing)
         stages.append(Stage("Extract Surface VTK", time.perf_counter() - start, f"{face_count:,} quad faces, {point_count:,} points, {surface_path.stat().st_size / 1048576:.2f} MB"))
+
+    if getattr(args, "vgm", None):
+        start = time.perf_counter()
+        fine = getattr(args, "fine", None) or (5, 5, 5)
+        stats = write_vgm_stream(args.vgm, grid, mins, spacing, set(), set(), fine,
+                                 "123", 1, 1000., (0., 0., -1.), 1, "Voxel model")
+        print(f"Wrote {args.vgm}\n{format_statistics(stats)}")
+        print(f"Statistics: {args.vgm.with_suffix('.stats.json')}")
+        stages.append(Stage("Write VGM / Statistics", time.perf_counter() - start, str(args.vgm)))
 
     stages.append(Stage("Total", time.perf_counter() - total_start, "all stages"))
     return stages
@@ -381,11 +389,21 @@ def main() -> None:
     parser.add_argument("--reuse-stl", action="store_true")
     parser.add_argument("--python", action="store_true", help="Use pure Python voxelizer instead of C++.")
     parser.add_argument("--surface", action="store_true", help="Also write directly visible exterior surface VTK.")
+    parser.add_argument("--vgm", type=Path, help="Also generate this VGM directly, without boundary conditions.")
+    parser.add_argument("--no-occupancy", action="store_true", help="Skip occupancy VTK output (use with --vgm or --surface).")
+    add_fine_arguments(parser)
+    add_box_arguments(parser)
     args = parser.parse_args()
+    args.fine = resolve_fine(args, parser)
+    if args.no_occupancy and not (args.vgm or args.surface):
+        parser.error("--no-occupancy requires --vgm or --surface")
 
     try:
         stages = run(args)
     except StepMeshingError as exc:
+        print(str(exc), file=sys.stderr)
+        raise SystemExit(2) from None
+    except ValueError as exc:
         print(str(exc), file=sys.stderr)
         raise SystemExit(2) from None
     print_report(stages)

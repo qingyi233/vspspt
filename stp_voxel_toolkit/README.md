@@ -4,7 +4,7 @@
 
 ## 目录
 
-- `gui.py`：图形界面，选择 `.stp/.step/.stl` 后自动输出体素 VTK。
+- `gui.py`：图形界面，选择 `.stp/.step/.stl` 后输出体素 VTK 或直接生成 VGM。
 - `stp_to_voxel_vtk.py`：命令行转换工具，适合批处理和亿级体素。
 - `vtk_selection_to_vgm.py`：读取体素 VTK 和 ParaView 保存的两个选区 VTK，生成自定义 VGM。
 - `stl_surface_to_vgm.py`：读取体素 VTK 和 UG/ParaView 导出的两个曲面 STL，生成自定义 VGM。
@@ -43,23 +43,42 @@ py -3.14 -m venv .venv
 ..\.venv\Scripts\python.exe gui.py
 ```
 
-建议设置：
+GUI 有两个分页：
 
-- `Target cells`：`100000000` 或 `1e8`，生成约 1 亿总体素单元。
-- 勾选 `Use C++ voxelizer`。
-- 勾选 `Write surface VTK`，这个文件能在 ParaView 中直接看到结构。
-- 勾选 `Reuse STL`，第二次运行会跳过 STEP 转 STL，速度明显更快。
+- `模型生成`：统一选择 STEP/STL 或 occupancy VTK，设置输出目录后点击“开始生成”。默认输出 VGM，也可为 CAD 输入额外选择占据场或表面 VTK。VGM 自动命名为 `<输入文件名>.vgm`。
+- `有限元求解`：读取 VGM 并调用 DLUTFEM 计算，结果写入指定目录。
 
-GUI 现在有三个分页：
+CAD 输入可选择“目标体素数”或“最长轴格数”，两种方式只显示一个数值框。例如目标体素数 `100000000` / `1e8` 对应约一亿总体素。
+occupancy VTK 输入沿用原网格，自动隐藏体素化和包围盒设置。
+射线、C++ 后端、复用 STL、曲面网格尺寸、选区映射，以及求解器和临时目录等技术选项收在“高级设置”中；默认已启用 C++ 和复用 STL。
+网格统计只在结果区显示，模块耗时和运行进度保留在日志中，完成时不再重复弹窗。
 
-- `体素化生成 VTK`：把 STP/STEP/STL 转成体素 VTK。
-- `选区生成 VGM`：用 occupancy VTK 加两个选区 VTK/STL 生成 VGM。
-- `VGM 有限元求解`：调用 `DLUTFEM.exe` 计算 VGM，并把结果 `.h5/.vtk/.db/.log` 回拷到指定目录。
+### 直接生成 VGM、自定义包围盒和统计
 
-体素化页会显示各模块耗时、占比和累计时间；VGM 生成和有限元求解会在日志窗口持续输出状态。
+- 在“模型生成”页选择 STEP/STL，保留默认的 VGM 输出即可一次生成；两种 VTK 输出按需勾选。
+- 已有 occupancy VTK 时直接将其作为输入。约束和载荷选区对两类输入都分别可选；只有填写选区后，才显示对应的自由度或力参数。
+- CAD 输入可勾选“自定义包围盒”，填写世界坐标下的“最小角点 X,Y,Z”和“尺寸 X,Y,Z”，单位与模型相同。模型不移动；包围盒未完全包含模型时立即报错，并列出模型和包围盒范围。尺寸必须为正且所有数值有限。
+- 目标体素数和最长轴分辨率按所选包围盒计算。自定义包围盒直接生成 VGM 时，各轴网格数向上对齐至细分的整数倍，再计算间距，因此最终 BOX 保持指定尺寸；实际网格数会在日志里显示。
+- 每次生成 VGM 后显示统计，并在同目录保存同名 `*.stats.json`：实体细单元、实体去重节点、细尺度自由度、有效粗单元/节点/自由度，以及含空单元的完整粗网格规模。
+- 节点按实体单元的八角点并集去重；自由度按每节点 3 个平移分量统计，是扣除约束及求解器凝聚前的规模。约束粗节点及其位移自由度另列，不能直接从细尺度自由度里相减。
 
-在“选区生成 VGM”页的“细分预设”中可选择 `5x5x5`（默认）或 `10x10x10`。
-选择后会自动填写细分 X/Y/Z；也可以直接修改三个数值，此时显示“自定义”。
+命令行直接输出 VGM（从工具包目录执行，包围盒参数需按实际模型调整）：
+
+```powershell
+python stp_to_voxel_vtk.py --input model.stp --resolution 100 `
+  --box-origin -10 -10 -10 --box-size 200 200 200 `
+  --vgm output/model.vgm --fine-preset 555 --no-occupancy
+```
+
+已有 occupancy VTK，不添加约束和载荷：
+
+```powershell
+python vtk_selection_to_vgm.py --occupancy output/model_occupancy.vtk --output output/model.vgm
+```
+
+VTK 使用世界坐标；VGM 的 `BOX` 定义局部网格尺寸，原点保存在 `$ ORIGIN` 注释和统计 JSON 中。模型在包围盒内的相对位置保持一致。仅含几何的 VGM 可用于后续添加边界条件；静力求解前仍需设置合适的约束和载荷。
+
+“粗单元细分”可选择 `5x5x5`（默认）或 `10x10x10`。只有选择“自定义”时才显示细分 X/Y/Z 输入框。
 `10x10x10` 表示每个粗单元含 1000 个细体素，不是整个模型只划分 10 格。
 使用同一份 occupancy VTK 时，细体素间距和实体细体素数量保持不变，仅改变粗单元分组。
 不足整除的边界补空，BOX 外包尺寸相应增大，不会压缩原有几何。

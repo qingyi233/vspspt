@@ -5,7 +5,7 @@
 #include "MeshReader.h"
 #include "MeshWriter.h"
 
-#define PYPRINT 1;
+#define PYPRINT 1
 
 using namespace Eigen;
 template<typename T> using RowArrayX = Array<T, 1, Dynamic, RowMajor>;
@@ -52,8 +52,8 @@ public:
 
 
 	void initSize(int, int, int);
-	py::array_t<int> VOXELISE(std::string, std::string ray = "xyz", bool parallel = true);
-	py::array_t<int> VOXELISE(py::array_t<double>, std::string ray = "xyz", bool parallel = true);
+	py::array_t<int> VOXELISE(std::string, std::string ray = "xyz", bool parallel = true, py::object bounds = py::none());
+	py::array_t<int> VOXELISE(py::array_t<double>, std::string ray = "xyz", bool parallel = true, py::object bounds = py::none());
 	bool gen_vox_info();
 	void save_mesh(std::string);
 

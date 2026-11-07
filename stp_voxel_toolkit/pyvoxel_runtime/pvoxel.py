@@ -210,7 +210,7 @@ class Voxel:
         self._Nz = z
 
     
-    def VOXELISE(self, mesharg, ray="xyz", parallel=False):
+    def VOXELISE(self, mesharg, ray="xyz", parallel=False, bounds=None):
         """
         Voxelise a 3D triangular-polygon mesh. parameter "mesharg" is a filename of <.stl> file
         or a numpy.ndarray stored all triangular-polygon mesh
@@ -239,6 +239,21 @@ class Voxel:
         self._gridCOy   = np.arange(self.__meshYmin+voxwidth/2, self.__meshYmax-voxwidth/2, voxwidth)    
         voxwidth  = (self.__meshZmax-self.__meshZmin)/(self._Nz+1/2)
         self._gridCOz   = np.arange(self.__meshZmin+voxwidth/2, self.__meshZmax-voxwidth/2, voxwidth)  
+
+        if bounds is not None:
+            box = np.asarray(bounds, dtype=float)
+            model_min = np.array([self.__meshXmin, self.__meshYmin, self.__meshZmin])
+            model_max = np.array([self.__meshXmax, self.__meshYmax, self.__meshZmax])
+            if (box.shape != (2, 3) or not np.isfinite(box).all()
+                    or np.any(box[0] >= box[1]) or np.any(box[0] > model_min)
+                    or np.any(box[1] < model_max)):
+                raise ValueError("Bounding box must fully contain the mesh and have positive finite sizes")
+            self.__meshXmin, self.__meshYmin, self.__meshZmin = box[0]
+            self.__meshXmax, self.__meshYmax, self.__meshZmax = box[1]
+            centers = [box[0, axis] + (np.arange(count) + 0.5) *
+                       (box[1, axis] - box[0, axis]) / count
+                       for axis, count in enumerate((self._Nx, self._Ny, self._Nz))]
+            self._gridCOx, self._gridCOy, self._gridCOz = centers
 
         ### Check that the output grid is large enough to cover the mesh
         gridcheckX = 0
@@ -501,27 +516,19 @@ def _VOXELISE(gridCOx,gridCOy,gridCOz,meshXYZ):
                 #Only continue the analysis if some nearby facets were actually identified
                 if possibleCROSSLIST.size > 0:  
                     # 判断给出的坐标是否在闭合的三角形中，向量叉积法
-                    for loopCHECKFACET in possibleCROSSLIST.flatten():
-                        #Check if ray crosses the facet.  This method is much (>>10 times) faster than using the built-in function 'inpolygon'.
-                        #Taking each edge of the facet in turn, check if the ray is on the same side as the opposing vertex.
-                        Y1predicted = meshXYZ[loopCHECKFACET,1,1] - ((meshXYZ[loopCHECKFACET,1,1]-meshXYZ[loopCHECKFACET,1,2]) * (meshXYZ[loopCHECKFACET,0,1]-meshXYZ[loopCHECKFACET,0,0])/(meshXYZ[loopCHECKFACET,0,1]-meshXYZ[loopCHECKFACET,0,2]))
-                        YRpredicted = meshXYZ[loopCHECKFACET,1,1] - ((meshXYZ[loopCHECKFACET,1,1]-meshXYZ[loopCHECKFACET,1,2]) * (meshXYZ[loopCHECKFACET,0,1]-gridCOx[loopX])/(meshXYZ[loopCHECKFACET,0,1]-meshXYZ[loopCHECKFACET,0,2]))
-                        
-                        if (Y1predicted > meshXYZ[loopCHECKFACET,1,0] and YRpredicted > gridCOy[loopY]) or (Y1predicted < meshXYZ[loopCHECKFACET,1,0] and YRpredicted < gridCOy[loopY]):
-                            #The ray is on the same side of the 2-3 edge as the 1st vertex.
-                            Y2predicted = meshXYZ[loopCHECKFACET,1,2] - ((meshXYZ[loopCHECKFACET,1,2]-meshXYZ[loopCHECKFACET,1,0]) * (meshXYZ[loopCHECKFACET,0,2]-meshXYZ[loopCHECKFACET,0,1])/(meshXYZ[loopCHECKFACET,0,2]-meshXYZ[loopCHECKFACET,0,0]))
-                            YRpredicted = meshXYZ[loopCHECKFACET,1,2] - ((meshXYZ[loopCHECKFACET,1,2]-meshXYZ[loopCHECKFACET,1,0]) * (meshXYZ[loopCHECKFACET,0,2]-gridCOx[loopX])/(meshXYZ[loopCHECKFACET,0,2]-meshXYZ[loopCHECKFACET,0,0]))
-                        
-                            if (Y2predicted > meshXYZ[loopCHECKFACET,1,1] and YRpredicted > gridCOy[loopY]) or (Y2predicted < meshXYZ[loopCHECKFACET,1,1] and YRpredicted < gridCOy[loopY]):
-                                #The ray is on the same side of the 3-1 edge as the 2nd vertex.
-                                Y3predicted = meshXYZ[loopCHECKFACET,1,0] - ((meshXYZ[loopCHECKFACET,1,0]-meshXYZ[loopCHECKFACET,1,1]) * (meshXYZ[loopCHECKFACET,0,0]-meshXYZ[loopCHECKFACET,0,2])/(meshXYZ[loopCHECKFACET,0,0]-meshXYZ[loopCHECKFACET,0,1]))
-                                YRpredicted = meshXYZ[loopCHECKFACET,1,0] - ((meshXYZ[loopCHECKFACET,1,0]-meshXYZ[loopCHECKFACET,1,1]) * (meshXYZ[loopCHECKFACET,0,0]-gridCOx[loopX])/(meshXYZ[loopCHECKFACET,0,0]-meshXYZ[loopCHECKFACET,0,1]))
-                                
-                                if (Y3predicted > meshXYZ[loopCHECKFACET,1,2] and YRpredicted > gridCOy[loopY]) or (Y3predicted < meshXYZ[loopCHECKFACET,1,2] and YRpredicted < gridCOy[loopY]):
-                                    #The ray is on the same side of the 1-2 edge as the 3rd vertex.
-                                    #The ray passes through the facet since it is on the correct side of all 3 edges
-                                    facetCROSSLIST = np.insert(facetCROSSLIST,facetCROSSLIST.size,loopCHECKFACET,0)
-                
+                    for face in possibleCROSSLIST.flatten():
+                        ax, ay = meshXYZ[face, :2, 0]
+                        bx, by = meshXYZ[face, :2, 1] - (ax, ay)
+                        cx, cy = meshXYZ[face, :2, 2] - (ax, ay)
+                        determinant = bx * cy - by * cx
+                        if determinant == 0:
+                            continue
+                        px, py = gridCOx[loopX] - ax, gridCOy[loopY] - ay
+                        u = (px * cy - py * cx) / determinant
+                        v = (bx * py - by * px) / determinant
+                        if u >= -1e-12 and v >= -1e-12 and u + v <= 1 + 1e-12:
+                            facetCROSSLIST = np.append(facetCROSSLIST, face)
+
                     #----------
                     # - 3 - Find the z coordinate of the locations where the ray crosses each facet or vertex:
                     #----------

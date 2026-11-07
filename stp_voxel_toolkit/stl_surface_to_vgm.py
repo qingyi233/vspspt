@@ -12,6 +12,7 @@ from pathlib import Path
 import numpy as np
 
 from vtk_selection_to_vgm import add_fine_arguments, read_occupancy, resolve_fine, write_vgm_stream
+from vgm_stats import format_statistics
 
 
 def read_ascii_or_binary_stl(path: Path) -> np.ndarray:
@@ -197,8 +198,8 @@ def vector3(text: str) -> tuple[float, float, float]:
 def main() -> None:
     parser = argparse.ArgumentParser(description="Generate VGM from occupancy VTK and selected surface STL files.")
     parser.add_argument("--occupancy", required=True, type=Path)
-    parser.add_argument("--constraint-stl", required=True, type=Path)
-    parser.add_argument("--load-stl", required=True, type=Path)
+    parser.add_argument("--constraint-stl", type=Path, help="Optional constraint surface.")
+    parser.add_argument("--load-stl", type=Path, help="Optional load surface.")
     parser.add_argument("--output", required=True, type=Path)
     add_fine_arguments(parser)
     parser.add_argument("--tolerance", type=float, default=None, help="Distance tolerance. Default: voxel diagonal.")
@@ -228,7 +229,7 @@ def main() -> None:
         tolerance,
         workers=args.workers,
         chunk_size=args.chunk_size,
-    )
+    ) if args.constraint_stl else set()
     print(f"Constraint voxels: {len(constraint_voxels):,}")
     load_voxels = surface_stl_to_voxels(
         args.load_stl,
@@ -238,13 +239,13 @@ def main() -> None:
         tolerance,
         workers=args.workers,
         chunk_size=args.chunk_size,
-    )
+    ) if args.load_stl else set()
     print(f"Load voxels: {len(load_voxels):,}")
 
     def progress(stage, done, total):
         print(f"{stage}: {done:,}/{total:,}")
 
-    write_vgm_stream(
+    stats = write_vgm_stream(
         args.output,
         occupancy,
         origin,
@@ -263,6 +264,8 @@ def main() -> None:
     )
     print(f"Wrote {args.output}")
     print(f"Size: {args.output.stat().st_size / 1048576:.2f} MB")
+    print(format_statistics(stats))
+    print(f"Statistics: {args.output.with_suffix('.stats.json')}")
 
 
 if __name__ == "__main__":

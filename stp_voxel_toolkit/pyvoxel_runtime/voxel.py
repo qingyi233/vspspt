@@ -122,7 +122,7 @@ class Voxel:
         self._Nz = self.voxel.NZ
 
     
-    def VOXELISE(self, mesharg, ray="xyz", parallel=True):
+    def VOXELISE(self, mesharg, ray="xyz", parallel=True, bounds=None):
         """
         Voxelise a 3D triangular-polygon mesh. parameter "mesharg" is a filename of <.stl> file
         or a numpy.ndarray stored all triangular-polygon mesh
@@ -131,7 +131,10 @@ class Voxel:
 
         "gridCOx",  "gridCOy",  "gridCOz"
         """
-        grid = self.voxel.VOXELISE(mesharg,ray,parallel)
+        if bounds is None:
+            grid = self.voxel.VOXELISE(mesharg,ray,parallel)
+        else:
+            grid = self.voxel.VOXELISE(mesharg,ray,parallel,bounds)
         return grid
     
     def gen_vox_info(self):

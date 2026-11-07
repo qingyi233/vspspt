@@ -189,10 +189,10 @@ class SubdivisionTests(unittest.TestCase):
         app._apply_fine_preset()
         self.assertEqual([v.get() for v in (app.vgm_fine_x_var, app.vgm_fine_y_var,
                                           app.vgm_fine_z_var)], ["10"] * 3)
-        app.vgm_occ_var.set(str(self.write_occupancy()))
+        app.step_var.set(str(self.write_occupancy()))
         app.vgm_constraint_var.set(str(self.write_selection("constraint.vtk", {(0, 0, 0)})))
         app.vgm_load_var.set(str(self.write_selection("load.vtk", self.loads)))
-        app.vgm_output_var.set(str(self.root / "gui.vgm"))
+        app.out_var.set(str(self.root))
         self.assertEqual(app._parse_vgm_config()["fine"], (10, 10, 10))
         app.vgm_fine_x_var.set("7")
         self.assertEqual(app.vgm_fine_preset_var.get(), "自定义")

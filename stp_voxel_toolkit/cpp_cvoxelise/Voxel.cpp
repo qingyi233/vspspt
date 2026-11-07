@@ -1,5 +1,19 @@
 #include "Voxel.h"
 #include <iomanip>
+#include <cmath>
+
+// Inclusive barycentric test: shared triangle edges must not leave holes in the grid.
+static bool rayCrossesTriangle(const py::array_t<double>& mesh, int face, double x, double y)
+{
+    double ax = mesh.at(face, 0, 0), ay = mesh.at(face, 1, 0);
+    double bx = mesh.at(face, 0, 1) - ax, by = mesh.at(face, 1, 1) - ay;
+    double cx = mesh.at(face, 0, 2) - ax, cy = mesh.at(face, 1, 2) - ay;
+    double determinant = bx * cy - by * cx;
+    if (determinant == 0.0) return false; // Parallel ray or degenerate projection.
+    double u = ((x - ax) * cy - (y - ay) * cx) / determinant;
+    double v = (bx * (y - ay) - by * (x - ax)) / determinant;
+    return u >= -1e-12 && v >= -1e-12 && u + v <= 1.0 + 1e-12;
+}
 
 Voxel::Voxel() :nnod(0), nele(0){
 	initSize(0, 0, 0);
@@ -15,16 +29,16 @@ void Voxel::initSize(int x, int y, int z)
 	NZ = z;
 }
 
-py::array_t<int> Voxel::VOXELISE(std::string filename, std::string raydirection, bool parallel)
+py::array_t<int> Voxel::VOXELISE(std::string filename, std::string raydirection, bool parallel, py::object bounds)
 {
 #if PYPRINT
 	py::print("recieved mesh data form C++ stl-reader");
 #endif // PYPRINTs
 	py::array_t<double> meshXYZ = Read_stl(filename).attr("pop")(0);
-	return VOXELISE(meshXYZ, raydirection, parallel);
+	return VOXELISE(meshXYZ, raydirection, parallel, bounds);
 }
 
-py::array_t<int> Voxel::VOXELISE(py::array_t<double> mesh, std::string raydirection, bool parallel)
+py::array_t<int> Voxel::VOXELISE(py::array_t<double> mesh, std::string raydirection, bool parallel, py::object bounds)
 {
 	
 	py::array_t<double> meshXYZ = mesh;
@@ -39,9 +53,25 @@ py::array_t<int> Voxel::VOXELISE(py::array_t<double> mesh, std::string raydirect
 	__meshZmin = meshXYZ[py::make_tuple(py::slice(0, N, 1), 2, py::slice(0, 3, 1))].attr("min")().cast<double>();
 	__meshZmax = meshXYZ[py::make_tuple(py::slice(0, N, 1), 2, py::slice(0, 3, 1))].attr("max")().cast<double>();
 
-	double dx = (__meshXmax - __meshXmin) / (NX + 0.5);
-	double dy = (__meshYmax - __meshYmin) / (NY + 0.5);
-	double dz = (__meshZmax - __meshZmin) / (NZ + 0.5);
+	if (!bounds.is_none()) {
+		auto box = py::array_t<double>::ensure(bounds);
+		if (!box || box.ndim() != 2 || box.shape(0) != 2 || box.shape(1) != 3)
+			throw py::value_error("Bounding box must be a 2x3 array of min/max coordinates");
+		double modelMin[] = {__meshXmin, __meshYmin, __meshZmin};
+		double modelMax[] = {__meshXmax, __meshYmax, __meshZmax};
+		for (int axis = 0; axis < 3; ++axis) {
+			if (!std::isfinite(box.at(0, axis)) || !std::isfinite(box.at(1, axis)) ||
+				box.at(0, axis) >= box.at(1, axis) || box.at(0, axis) > modelMin[axis] || box.at(1, axis) < modelMax[axis])
+				throw py::value_error("Bounding box must fully contain the mesh and have positive finite sizes");
+		}
+		__meshXmin = box.at(0, 0); __meshYmin = box.at(0, 1); __meshZmin = box.at(0, 2);
+		__meshXmax = box.at(1, 0); __meshYmax = box.at(1, 1); __meshZmax = box.at(1, 2);
+	}
+	// Explicit box coordinates use the same cell centers as the VTK/VGM geometry.
+	double extra = bounds.is_none() ? 0.5 : 0.0;
+	double dx = (__meshXmax - __meshXmin) / (NX + extra);
+	double dy = (__meshYmax - __meshYmin) / (NY + extra);
+	double dz = (__meshZmax - __meshZmin) / (NZ + extra);
 
 	RowVectorXd lx = RowVectorXd::LinSpaced(NX, __meshXmin + dx / 2.0, (__meshXmin + dx / 2.0) + dx * (NX - 1));
 	RowVectorXd ly = RowVectorXd::LinSpaced(NY, __meshYmin + dy / 2.0, (__meshYmin + dy / 2.0) + dy * (NY - 1));
@@ -332,29 +362,10 @@ py::array_t<int> Voxel::_VOXELISE(py::array_t<double> gx, py::array_t<double> gy
 				std::vector<int> facetCROSSLIST;
 				// - 2 - Check for crossed facets
 				//Only continue the analysis if some nearby facets were actually identified
-				double Y1predicted, Y2predicted, Y3predicted, YRpredicted;
 				double planecoA, planecoB, planecoC, planecoD;
 				for (int loopCHECKFACET : possibleCROSSLIST) {
-					//Check if ray crosses the facet.This method is much(>> 10 times) faster than using the built - in function 'inpolygon'.
-					//Taking each edge of the facet in turn, check if the ray is on the same side as the opposing vertex.
-					Y1predicted = meshXYZ.mutable_at(loopCHECKFACET, 1, 1) - ((meshXYZ.mutable_at(loopCHECKFACET, 1, 1) - meshXYZ.mutable_at(loopCHECKFACET, 1, 2)) * (meshXYZ.mutable_at(loopCHECKFACET, 0, 1) - meshXYZ.mutable_at(loopCHECKFACET, 0, 0)) / (meshXYZ.mutable_at(loopCHECKFACET, 0, 1) - meshXYZ.mutable_at(loopCHECKFACET, 0, 2)));
-					YRpredicted = meshXYZ.mutable_at(loopCHECKFACET, 1, 1) - ((meshXYZ.mutable_at(loopCHECKFACET, 1, 1) - meshXYZ.mutable_at(loopCHECKFACET, 1, 2)) * (meshXYZ.mutable_at(loopCHECKFACET, 0, 1) - gridCOx(loopX)) / (meshXYZ.mutable_at(loopCHECKFACET, 0, 1) - meshXYZ.mutable_at(loopCHECKFACET, 0, 2)));
-
-					if ((Y1predicted > meshXYZ.mutable_at(loopCHECKFACET, 1, 0) && YRpredicted > gridCOy(loopY)) || (Y1predicted < meshXYZ.mutable_at(loopCHECKFACET, 1, 0) && YRpredicted < gridCOy(loopY))) {
-						//The ray is on the same side of the 2 - 3 edge as the 1st vertex.
-						Y2predicted = meshXYZ.mutable_at(loopCHECKFACET, 1, 2) - ((meshXYZ.mutable_at(loopCHECKFACET, 1, 2) - meshXYZ.mutable_at(loopCHECKFACET, 1, 0)) * (meshXYZ.mutable_at(loopCHECKFACET, 0, 2) - meshXYZ.mutable_at(loopCHECKFACET, 0, 1)) / (meshXYZ.mutable_at(loopCHECKFACET, 0, 2) - meshXYZ.mutable_at(loopCHECKFACET, 0, 0)));
-						YRpredicted = meshXYZ.mutable_at(loopCHECKFACET, 1, 2) - ((meshXYZ.mutable_at(loopCHECKFACET, 1, 2) - meshXYZ.mutable_at(loopCHECKFACET, 1, 0)) * (meshXYZ.mutable_at(loopCHECKFACET, 0, 2) - gridCOx(loopX)) / (meshXYZ.mutable_at(loopCHECKFACET, 0, 2) - meshXYZ.mutable_at(loopCHECKFACET, 0, 0)));
-
-						if ((Y2predicted > meshXYZ.mutable_at(loopCHECKFACET, 1, 1) && YRpredicted > gridCOy(loopY)) || (Y2predicted < meshXYZ.mutable_at(loopCHECKFACET, 1, 1) && YRpredicted < gridCOy(loopY))) {
-							//The ray is on the same side of the 3 - 1 edge as the 2nd vertex.
-							Y3predicted = meshXYZ.mutable_at(loopCHECKFACET, 1, 0) - ((meshXYZ.mutable_at(loopCHECKFACET, 1, 0) - meshXYZ.mutable_at(loopCHECKFACET, 1, 1)) * (meshXYZ.mutable_at(loopCHECKFACET, 0, 0) - meshXYZ.mutable_at(loopCHECKFACET, 0, 2)) / (meshXYZ.mutable_at(loopCHECKFACET, 0, 0) - meshXYZ.mutable_at(loopCHECKFACET, 0, 1)));
-							YRpredicted = meshXYZ.mutable_at(loopCHECKFACET, 1, 0) - ((meshXYZ.mutable_at(loopCHECKFACET, 1, 0) - meshXYZ.mutable_at(loopCHECKFACET, 1, 1)) * (meshXYZ.mutable_at(loopCHECKFACET, 0, 0) - gridCOx(loopX)) / (meshXYZ.mutable_at(loopCHECKFACET, 0, 0) - meshXYZ.mutable_at(loopCHECKFACET, 0, 1)));
-
-							if ((Y3predicted > meshXYZ.mutable_at(loopCHECKFACET, 1, 2) && YRpredicted > gridCOy(loopY)) || (Y3predicted < meshXYZ.mutable_at(loopCHECKFACET, 1, 2) && YRpredicted < gridCOy(loopY)))
-								facetCROSSLIST.push_back(loopCHECKFACET);
-
-						}
-					}
+					if (rayCrossesTriangle(meshXYZ, loopCHECKFACET, gridCOx(loopX), gridCOy(loopY)))
+						facetCROSSLIST.push_back(loopCHECKFACET);
 				}
 
 				// - 3 - Find the z coordinate of the locations where the ray crosses each facet or vertex:
@@ -538,29 +549,10 @@ py::array_t<int> Voxel::_VOXELISE_Parallel(py::array_t<double> gx, py::array_t<d
 				std::vector<int> facetCROSSLIST;
 				// - 2 - Check for crossed facets
 				//Only continue the analysis if some nearby facets were actually identified
-				double Y1predicted, Y2predicted, Y3predicted, YRpredicted;
 				double planecoA, planecoB, planecoC, planecoD;
 				for (int loopCHECKFACET : possibleCROSSLIST) {
-					//Check if ray crosses the facet.This method is much(>> 10 times) faster than using the built - in function 'inpolygon'.
-					//Taking each edge of the facet in turn, check if the ray is on the same side as the opposing vertex.
-					Y1predicted = meshXYZ.mutable_at(loopCHECKFACET, 1, 1) - ((meshXYZ.mutable_at(loopCHECKFACET, 1, 1) - meshXYZ.mutable_at(loopCHECKFACET, 1, 2)) * (meshXYZ.mutable_at(loopCHECKFACET, 0, 1) - meshXYZ.mutable_at(loopCHECKFACET, 0, 0)) / (meshXYZ.mutable_at(loopCHECKFACET, 0, 1) - meshXYZ.mutable_at(loopCHECKFACET, 0, 2)));
-					YRpredicted = meshXYZ.mutable_at(loopCHECKFACET, 1, 1) - ((meshXYZ.mutable_at(loopCHECKFACET, 1, 1) - meshXYZ.mutable_at(loopCHECKFACET, 1, 2)) * (meshXYZ.mutable_at(loopCHECKFACET, 0, 1) - gridCOx(loopX)) / (meshXYZ.mutable_at(loopCHECKFACET, 0, 1) - meshXYZ.mutable_at(loopCHECKFACET, 0, 2)));
-
-					if ((Y1predicted > meshXYZ.mutable_at(loopCHECKFACET, 1, 0) && YRpredicted > gridCOy(loopY)) || (Y1predicted < meshXYZ.mutable_at(loopCHECKFACET, 1, 0) && YRpredicted < gridCOy(loopY))) {
-						//The ray is on the same side of the 2 - 3 edge as the 1st vertex.
-						Y2predicted = meshXYZ.mutable_at(loopCHECKFACET, 1, 2) - ((meshXYZ.mutable_at(loopCHECKFACET, 1, 2) - meshXYZ.mutable_at(loopCHECKFACET, 1, 0)) * (meshXYZ.mutable_at(loopCHECKFACET, 0, 2) - meshXYZ.mutable_at(loopCHECKFACET, 0, 1)) / (meshXYZ.mutable_at(loopCHECKFACET, 0, 2) - meshXYZ.mutable_at(loopCHECKFACET, 0, 0)));
-						YRpredicted = meshXYZ.mutable_at(loopCHECKFACET, 1, 2) - ((meshXYZ.mutable_at(loopCHECKFACET, 1, 2) - meshXYZ.mutable_at(loopCHECKFACET, 1, 0)) * (meshXYZ.mutable_at(loopCHECKFACET, 0, 2) - gridCOx(loopX)) / (meshXYZ.mutable_at(loopCHECKFACET, 0, 2) - meshXYZ.mutable_at(loopCHECKFACET, 0, 0)));
-
-						if ((Y2predicted > meshXYZ.mutable_at(loopCHECKFACET, 1, 1) && YRpredicted > gridCOy(loopY)) || (Y2predicted < meshXYZ.mutable_at(loopCHECKFACET, 1, 1) && YRpredicted < gridCOy(loopY))) {
-							//The ray is on the same side of the 3 - 1 edge as the 2nd vertex.
-							Y3predicted = meshXYZ.mutable_at(loopCHECKFACET, 1, 0) - ((meshXYZ.mutable_at(loopCHECKFACET, 1, 0) - meshXYZ.mutable_at(loopCHECKFACET, 1, 1)) * (meshXYZ.mutable_at(loopCHECKFACET, 0, 0) - meshXYZ.mutable_at(loopCHECKFACET, 0, 2)) / (meshXYZ.mutable_at(loopCHECKFACET, 0, 0) - meshXYZ.mutable_at(loopCHECKFACET, 0, 1)));
-							YRpredicted = meshXYZ.mutable_at(loopCHECKFACET, 1, 0) - ((meshXYZ.mutable_at(loopCHECKFACET, 1, 0) - meshXYZ.mutable_at(loopCHECKFACET, 1, 1)) * (meshXYZ.mutable_at(loopCHECKFACET, 0, 0) - gridCOx(loopX)) / (meshXYZ.mutable_at(loopCHECKFACET, 0, 0) - meshXYZ.mutable_at(loopCHECKFACET, 0, 1)));
-
-							if ((Y3predicted > meshXYZ.mutable_at(loopCHECKFACET, 1, 2) && YRpredicted > gridCOy(loopY)) || (Y3predicted < meshXYZ.mutable_at(loopCHECKFACET, 1, 2) && YRpredicted < gridCOy(loopY)))
-								facetCROSSLIST.push_back(loopCHECKFACET);
-
-						}
-					}
+					if (rayCrossesTriangle(meshXYZ, loopCHECKFACET, gridCOx(loopX), gridCOy(loopY)))
+						facetCROSSLIST.push_back(loopCHECKFACET);
 				}
 
 				// - 3 - Find the z coordinate of the locations where the ray crosses each facet or vertex:
