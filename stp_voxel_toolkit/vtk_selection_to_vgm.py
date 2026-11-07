@@ -12,12 +12,42 @@ from __future__ import annotations
 
 import argparse
 import math
+import operator
 import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import BinaryIO
 
 import numpy as np
+
+
+FINE_PRESETS = {"555": (5, 5, 5), "101010": (10, 10, 10)}
+
+
+def validate_fine(fine) -> tuple[int, int, int]:
+    try:
+        values = tuple(operator.index(value) for value in fine)
+    except TypeError as exc:
+        raise ValueError("Fine subdivisions must be three positive integers") from exc
+    if len(values) != 3 or any(value <= 0 for value in values):
+        raise ValueError("Fine subdivisions must be three positive integers")
+    return values
+
+
+def add_fine_arguments(parser: argparse.ArgumentParser) -> None:
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument("--fine", nargs=3, type=int, metavar=("NX", "NY", "NZ"),
+                       help="Fine voxels per coarse cell; default: 5 5 5. Supports 10 10 10.")
+    group.add_argument("--fine-preset", choices=tuple(FINE_PRESETS),
+                       help="555 = 5x5x5; 101010 = 10x10x10. Keeps input voxel spacing.")
+
+
+def resolve_fine(args, parser: argparse.ArgumentParser) -> tuple[int, int, int]:
+    try:
+        return validate_fine(args.fine if args.fine is not None
+                             else FINE_PRESETS[args.fine_preset or "555"])
+    except ValueError as exc:
+        parser.error(str(exc))
 
 
 VTK_DTYPE_BYTES = {
@@ -274,7 +304,7 @@ def constraint_coarse_nodes(
     coarse_dims: tuple[int, int, int],
     mode: str,
 ) -> set[int]:
-    fx, fy, fz = fine
+    fx, fy, fz = validate_fine(fine)
     cnx, cny, cnz = coarse_dims
     coarse_cells = {
         (min(i // fx, cnx - 1), min(j // fy, cny - 1), min(k // fz, cnz - 1))
@@ -395,14 +425,15 @@ def build_vgm(
     spc_node_mode: str = "cell-corners",
 ) -> list[str]:
     nx, ny, nz = occupancy.shape
-    fx, fy, fz = fine
+    fx, fy, fz = validate_fine(fine)
     cnx = math.ceil(nx / fx)
     cny = math.ceil(ny / fy)
     cnz = math.ceil(nz / fz)
     padded = np.zeros((cnx * fx, cny * fy, cnz * fz), dtype=np.uint8)
     padded[:nx, :ny, :nz] = occupancy
     fine_count = fx * fy * fz
-    box_size = (nx * spacing[0], ny * spacing[1], nz * spacing[2])
+    # Padding adds void cells; BOX must grow with it to preserve fine voxel spacing.
+    box_size = (cnx * fx * spacing[0], cny * fy * spacing[1], cnz * fz * spacing[2])
 
     lines = [
         "$ VGM generated from voxel VTK and ParaView selections",
@@ -488,14 +519,15 @@ def write_vgm_stream(
     spc_node_mode: str = "cell-corners",
 ) -> None:
     nx, ny, nz = occupancy.shape
-    fx, fy, fz = fine
+    fx, fy, fz = validate_fine(fine)
     cnx = math.ceil(nx / fx)
     cny = math.ceil(ny / fy)
     cnz = math.ceil(nz / fz)
     padded = np.zeros((cnx * fx, cny * fy, cnz * fz), dtype=np.uint8)
     padded[:nx, :ny, :nz] = occupancy
     fine_count = fx * fy * fz
-    box_size = (nx * spacing[0], ny * spacing[1], nz * spacing[2])
+    # Padding adds void cells; BOX must grow with it to preserve fine voxel spacing.
+    box_size = (cnx * fx * spacing[0], cny * fy * spacing[1], cnz * fz * spacing[2])
     total_coarse = cnx * cny * cnz
 
     constraint_nodes = constraint_coarse_nodes(constraint_voxels, fine, (cnx, cny, cnz), spc_node_mode)
@@ -594,7 +626,7 @@ def main() -> None:
     parser.add_argument("--constraint-selection", required=True, type=Path, help="ParaView Extract Selection VTK for constraints.")
     parser.add_argument("--load-selection", required=True, type=Path, help="ParaView Extract Selection VTK for loads.")
     parser.add_argument("--output", required=True, type=Path)
-    parser.add_argument("--fine", nargs=3, type=int, default=(5, 5, 5), metavar=("NX", "NY", "NZ"))
+    add_fine_arguments(parser)
     parser.add_argument("--spc-dof", default="123", help="SPC1 constrained DOF, e.g. 123.")
     parser.add_argument("--spc-node-mode", choices=("cell-corners", "cell-min-corner"), default="cell-corners")
     parser.add_argument("--force-sid", type=int, default=1)
@@ -604,9 +636,7 @@ def main() -> None:
     parser.add_argument("--title", default="Voxel VGM from ParaView selections")
     args = parser.parse_args()
 
-    fine = tuple(int(x) for x in args.fine)
-    if any(x <= 0 for x in fine):
-        raise SystemExit("--fine values must be positive")
+    fine = resolve_fine(args, parser)
 
     occupancy, origin, spacing = read_occupancy(args.occupancy)
     dims = occupancy.shape

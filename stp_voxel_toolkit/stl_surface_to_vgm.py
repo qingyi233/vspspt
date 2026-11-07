@@ -11,7 +11,7 @@ from pathlib import Path
 
 import numpy as np
 
-from vtk_selection_to_vgm import read_occupancy, write_vgm_stream
+from vtk_selection_to_vgm import add_fine_arguments, read_occupancy, resolve_fine, write_vgm_stream
 
 
 def read_ascii_or_binary_stl(path: Path) -> np.ndarray:
@@ -200,7 +200,7 @@ def main() -> None:
     parser.add_argument("--constraint-stl", required=True, type=Path)
     parser.add_argument("--load-stl", required=True, type=Path)
     parser.add_argument("--output", required=True, type=Path)
-    parser.add_argument("--fine", nargs=3, type=int, default=(5, 5, 5))
+    add_fine_arguments(parser)
     parser.add_argument("--tolerance", type=float, default=None, help="Distance tolerance. Default: voxel diagonal.")
     parser.add_argument("--workers", type=int, default=max(1, min(8, (os.cpu_count() or 2) // 2)), help="Parallel worker threads for STL surface mapping.")
     parser.add_argument("--chunk-size", type=int, default=64, help="Triangles per parallel task.")
@@ -209,6 +209,7 @@ def main() -> None:
     parser.add_argument("--force", type=float, default=1000.0)
     parser.add_argument("--direction", type=vector3, default=(0.0, 0.0, -1.0))
     args = parser.parse_args()
+    fine = resolve_fine(args, parser)
 
     occupancy, origin, spacing = read_occupancy(args.occupancy)
     tolerance = args.tolerance
@@ -216,6 +217,7 @@ def main() -> None:
         tolerance = math.sqrt(spacing[0] ** 2 + spacing[1] ** 2 + spacing[2] ** 2)
     print(f"Grid: {occupancy.shape[0]}x{occupancy.shape[1]}x{occupancy.shape[2]}")
     print(f"Spacing: {spacing}, tolerance={tolerance:.9g}")
+    print(f"Fine subdivisions: {fine[0]}x{fine[1]}x{fine[2]}")
 
     print(f"Workers: {args.workers}, chunk_size={args.chunk_size}")
     constraint_voxels = surface_stl_to_voxels(
@@ -249,7 +251,7 @@ def main() -> None:
         spacing,
         constraint_voxels,
         load_voxels,
-        tuple(args.fine),
+        fine,
         args.spc_dof,
         1,
         args.force,

@@ -488,6 +488,9 @@ class VoxelGui(tk.Tk):
         self.vgm_fine_x_var = tk.StringVar(value="5")
         self.vgm_fine_y_var = tk.StringVar(value="5")
         self.vgm_fine_z_var = tk.StringVar(value="5")
+        self.vgm_fine_preset_var = tk.StringVar(value="5x5x5")
+        for var in (self.vgm_fine_x_var, self.vgm_fine_y_var, self.vgm_fine_z_var):
+            var.trace_add("write", self._sync_fine_preset)
         self.vgm_spc_dof_var = tk.StringVar(value="123")
         self.vgm_force_var = tk.StringVar(value="1000")
         self.vgm_direction_var = tk.StringVar(value="0,0,-1")
@@ -634,6 +637,13 @@ class VoxelGui(tk.Tk):
 
         spc_mode_frame = ttk.Frame(vgm_frame)
         spc_mode_frame.grid(row=5, column=0, columnspan=3, sticky="w", pady=(8, 0))
+        ttk.Label(spc_mode_frame, text="细分预设").pack(side="left")
+        fine_preset = ttk.Combobox(
+            spc_mode_frame, textvariable=self.vgm_fine_preset_var,
+            values=("5x5x5", "10x10x10", "自定义"), width=12, state="readonly",
+        )
+        fine_preset.pack(side="left", padx=(6, 16))
+        fine_preset.bind("<<ComboboxSelected>>", self._apply_fine_preset)
         ttk.Label(spc_mode_frame, text="SPC粗节点映射").pack(side="left")
         ttk.Combobox(
             spc_mode_frame,
@@ -643,7 +653,7 @@ class VoxelGui(tk.Tk):
             state="readonly",
         ).pack(side="left", padx=(6, 16))
 
-        vgm_help = ttk.Label(vgm_frame, text="占据场必须选择 occupancy VTK；约束/载荷可以选择选区 VTK 或 UG 提取面的 STL。默认每个 VGM 粗单元包含 5x5x5 个细体素。", foreground="#555555")
+        vgm_help = ttk.Label(vgm_frame, text="占据场选择 occupancy VTK；约束/载荷选择 VTK 或曲面 STL。支持 5x5x5 / 10x10x10，保持细体素尺寸；10x10x10 需支持该细分的求解器及 EN_10 权重。", foreground="#555555", wraplength=1000)
         vgm_help.grid(row=6, column=0, columnspan=3, sticky="w", pady=(8, 0))
 
         solve_frame = ttk.LabelFrame(solve_tab, text="DLUTFEM 求解 VGM", padding=10)
@@ -805,6 +815,19 @@ class VoxelGui(tk.Tk):
         self.worker = threading.Thread(target=self._run_worker, args=(config,), daemon=True)
         self.worker.start()
 
+    def _sync_fine_preset(self, *_args) -> None:
+        label = "x".join(var.get().strip() for var in
+                         (self.vgm_fine_x_var, self.vgm_fine_y_var, self.vgm_fine_z_var))
+        self.vgm_fine_preset_var.set(label if label in ("5x5x5", "10x10x10") else "自定义")
+
+    def _apply_fine_preset(self, _event=None) -> None:
+        label = self.vgm_fine_preset_var.get()
+        if label in ("5x5x5", "10x10x10"):
+            for var, value in zip(
+                (self.vgm_fine_x_var, self.vgm_fine_y_var, self.vgm_fine_z_var), label.split("x")
+            ):
+                var.set(value)
+
     def _parse_vgm_config(self) -> dict[str, object]:
         occupancy = Path(self.vgm_occ_var.get())
         constraint = Path(self.vgm_constraint_var.get())
@@ -939,6 +962,7 @@ class VoxelGui(tk.Tk):
             occupancy, origin, spacing = read_occupancy(occupancy_path)
             dims = occupancy.shape
             log_put(self.queue, f"体素尺寸: {dims[0]} x {dims[1]} x {dims[2]}")
+            log_put(self.queue, f"VGM 细分: {fine[0]}x{fine[1]}x{fine[2]}，细体素间距: {spacing}")
 
             log_put(self.queue, f"读取约束选区 VTK: {constraint_path}")
             if constraint_path.suffix.lower() == ".stl":
