@@ -54,6 +54,32 @@ class GenerationTests(unittest.TestCase):
         write_ascii_stl(path, "cube", cube_mesh().transpose(0, 2, 1).reshape(-1, 3).tolist())
         return path
 
+    def test_tangent_rays_at_grid_edges_preserve_solid_cells(self):
+        from gui import pvoxel, voxel
+
+        vertices = np.array([(0, 0, 0), (0, 2, 0), (0, 0, 2), (2, 0, 0)], dtype=float)
+        triangles = vertices[[(0, 1, 2), (0, 2, 3), (0, 3, 1), (1, 3, 2)]].transpose(0, 2, 1)
+        bounds = np.array([[0., 0., 0.], [2., 2., 2.]])
+        # The Z rays at x + y = 2 hit the tetrahedron at just one point.
+        centers = 0.25 + 0.5 * np.indices((4, 4, 4))
+        expected = centers.sum(axis=0) < 2.
+        for backend in (pvoxel, voxel):
+            with self.subTest(backend=backend.__name__), contextlib.redirect_stdout(io.StringIO()):
+                grid = backend.Voxel(4, 4, 4).VOXELISE(triangles, ray="z", parallel=False, bounds=bounds)
+                if grid.ndim == 4:
+                    grid = grid[..., 0]
+                np.testing.assert_array_equal(grid, expected)
+
+    def run_count_button(self, app, button):
+        with patch.object(app, "_begin_task") as begin, patch("gui.messagebox.showerror") as error:
+            button.invoke()
+            error.assert_not_called()
+            worker, request, _ = begin.call_args.args
+        with contextlib.redirect_stdout(io.StringIO()), patch("gui.messagebox.showerror") as error:
+            worker(request)
+            app._poll_queue()
+            error.assert_not_called()
+
     def test_node_counts_match_independent_corner_union(self):
         rng = np.random.default_rng(12)
         for shape in ((1, 1, 1), (2, 3, 4), (4, 1, 2), (3, 5, 2)):
@@ -74,8 +100,11 @@ class GenerationTests(unittest.TestCase):
     def test_optional_boundaries_have_no_dangling_cards_or_references(self):
         for constraints, loads, stream in itertools.product((False, True), repeat=3):
             with self.subTest(constraints=constraints, loads=loads, stream=stream):
-                args = (np.ones((2, 2, 2), np.uint8), (0., 0., 0.), (1., 1., 1.),
-                        {(0, 0, 0)} if constraints else set(), {(1, 1, 1)} if loads else set(),
+                occupancy = np.ones((2, 2, 2), np.uint8)
+                occupancy[0, 0, 1] = 0
+                candidates = {(0, 0, 1), (1, 1, 1)} if loads else {(0, 0, 1)}
+                args = (occupancy, (0., 0., 0.), (1., 1., 1.),
+                        {(0, 0, 0)} if constraints else set(), candidates,
                         (2, 2, 2), "13", 1, 50., (0., 0., -1.), 1, "test")
                 if stream:
                     path = self.root / "model.vgm"
@@ -317,12 +346,63 @@ class GenerationTests(unittest.TestCase):
         app.vgm_load_var.set(str(selection))
         self.assertEqual(app.constraint_fields.winfo_manager(), "pack")
         self.assertEqual(app.load_fields.winfo_manager(), "pack")
+        self.run_count_button(app, app.load_count_button)
+        self.assertEqual(app.grid_count_var.get(), "实体体素 8")
+        self.assertEqual(app.load_count_var.get(), "预计命中 1 个实体细单元")
+        self.assertFalse((self.root / "with_boundaries").exists())
         with contextlib.redirect_stdout(io.StringIO()):
             run_pipeline(app._parse_config(), queue.Queue())
         text = (self.root / "with_boundaries" / "cube.vgm").read_text()
         self.assertIn("   SPC = 2", text)
         self.assertIn("   LOAD = 21", text)
         self.assertIn("FORCE", text)
+
+    def test_gui_counts_solid_load_cells_and_exports_requested_total(self):
+        from gui import FORCE_TOTAL, VoxelGui
+        from stp_to_voxel_vtk import write_occupancy_vtk
+        from test_vgm_subdivisions import cards, fields
+
+        app = VoxelGui()
+        app.withdraw()
+        self.addCleanup(app.destroy)
+        occupancy = np.zeros((3, 2, 2), np.uint8)
+        occupancy[0, 0, 0] = occupancy[1, 0, 0] = occupancy[2, 1, 1] = 1
+        path = self.root / "sparse.vtk"
+        write_occupancy_vtk(path, occupancy, (0., 0., 0.), (1., 1., 1.))
+        app.step_var.set(str(path))
+        app.out_var.set("")
+        self.run_count_button(app, app.grid_count_button)
+        self.assertEqual(app.grid_count_var.get(), "实体体素 3")
+
+        selection = self.root / "load.vtk"
+        header = "# vtk DataFile Version 3.0\nload\nASCII\nDATASET POLYDATA\n"
+        scalar = "SCALARS voxel_eid int\nLOOKUP_TABLE default\n"
+        selection.write_text(header + "CELL_DATA 5\n" + scalar + "1 2 1 3 13\n")
+        app.vgm_load_var.set(str(selection))
+        app.vgm_force_var.set("")  # Counting does not require load magnitude.
+        self.run_count_button(app, app.load_count_button)
+        self.assertEqual(app.load_count_var.get(), "预计命中 2 个实体细单元")
+        self.assertFalse(list(self.root.glob("*.vgm")))
+
+        app.out_var.set(str(self.root))
+        self.assertEqual(app.load_count_var.get(), "预计命中 2 个实体细单元")
+        app.vgm_force_mode_var.set(FORCE_TOTAL)
+        app.vgm_force_var.set("90")
+        app.vgm_direction_var.set("0,0,-2")
+        app._run_vgm_worker(app._parse_vgm_config())
+        output = self.root / "sparse.vgm"
+        force = next(lines for name, lines in cards(output.read_text()) if name == "FORCE")
+        self.assertEqual(float(fields(force[:1])[2]), 45.)
+        self.assertEqual([float(value) for value in fields(force[:1])[3:6]], [0., 0., -1.])
+        self.assertEqual(list(map(int, fields(force[1:])))[1:], [1, 1] + [0] * 123)
+
+        empty_selection = self.root / "void_load.vtk"
+        empty_selection.write_text(header + "CELL_DATA 1\n" + scalar + "3\n")
+        app.vgm_load_var.set(str(empty_selection))
+        app.out_var.set(str(self.root / "empty"))
+        app._run_vgm_worker(app._parse_vgm_config())
+        self.assertTrue(any(item[0] == "error" and "未命中实体细单元" in item[1] for item in app.queue.queue))
+        self.assertFalse((self.root / "empty" / "sparse.vgm").exists())
 
 
 if __name__ == "__main__":

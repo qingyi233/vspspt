@@ -15,6 +15,28 @@ static bool rayCrossesTriangle(const py::array_t<double>& mesh, int face, double
     return u >= -1e-12 && v >= -1e-12 && u + v <= 1.0 + 1e-12;
 }
 
+static void correctAmbiguousRays(py::array_t<int>& grid, const std::vector<int>& rays)
+{
+    auto cells = grid.mutable_unchecked<3>();
+    for (size_t index = 0; index < rays.size(); index += 2) {
+        const py::ssize_t x = rays[index];
+        const py::ssize_t y = rays[index + 1];
+        const auto firstX = std::max<py::ssize_t>(0, x - 1);
+        const auto lastX = std::min(cells.shape(0) - 1, x + 1);
+        const auto firstY = std::max<py::ssize_t>(0, y - 1);
+        const auto lastY = std::min(cells.shape(1) - 1, y + 1);
+        for (py::ssize_t z = 0; z < cells.shape(2); ++z) {
+            // Neighbors outside the grid contribute zero.
+            int neighbors = -cells(x, y, z);
+            for (auto i = firstX; i <= lastX; ++i)
+                for (auto j = firstY; j <= lastY; ++j)
+                    neighbors += cells(i, j, z);
+            if (neighbors >= 4)
+                cells(x, y, z) = 1;
+        }
+    }
+}
+
 Voxel::Voxel() :nnod(0), nele(0){
 	initSize(0, 0, 0);
 }
@@ -424,51 +446,7 @@ py::array_t<int> Voxel::_VOXELISE(py::array_t<double> gx, py::array_t<double> gy
 
 
 	}
-	//For rays where the voxelisation did not give a clear result, the ray is computed by interpolating from the surrounding rays.
-	py::ssize_t countCORRECTIONLIST = correctionLIST.size()/2;
-	if (countCORRECTIONLIST > 0) {
-		Map<Array<int, Dynamic, 2, RowMajor>> correctionArray (correctionLIST.data(), countCORRECTIONLIST, 2);
-		//If necessary, add a one - pixel border around the x and y edges of thearray.
-		//This prevents an error if the code tries to interpolate a ray at the edge of the x, y grid.
-		if (correctionArray.colwise().minCoeff()(0) == 1 || correctionArray.colwise().maxCoeff()(0) == gridCOx.size() ||
-			correctionArray.colwise().minCoeff()(1) == 1 ||correctionArray.colwise().maxCoeff()(1) == gridCOy.size()) {
-			// padding in X,Y. not in Z
-			py::array_t<int> gridpadding = py::array_t<int>((voxcountX+2) * (voxcountY+2) * voxcountZ).attr("reshape")(std::make_tuple(voxcountX+2, voxcountY+2, voxcountZ));
-			setConstValue(gridpadding, (int)0);
-			gridpadding[py::make_tuple(py::slice(1, voxcountX+1, 1),
-				py::slice(1, voxcountY+1, 1),
-				py::slice(0, voxcountZ, 1))] = gridOUTPUT;
-			gridOUTPUT = gridpadding;
-			correctionArray = correctionArray + 1;
-
-		}
-		for (int loopC = 0; loopC < countCORRECTIONLIST; loopC++) {
-			int lx = correctionArray(loopC, 0);
-			int ly = correctionArray(loopC, 1);
-			// Surrounding elements
-			// t1 t2 t3
-			// t4    t5
-			// t6 t7 t8
-			RowArrayX<int> t1 = toRowArray(gridOUTPUT[py::make_tuple(lx - 1, ly - 1, py::slice(0, voxcountZ, 1))].cast<py::array_t<int>>());
-			RowArrayX<int> t2 = toRowArray(gridOUTPUT[py::make_tuple(lx - 1, ly, py::slice(0, voxcountZ, 1))].cast<py::array_t<int>>());
-			RowArrayX<int> t3 = toRowArray(gridOUTPUT[py::make_tuple(lx - 1, ly + 1, py::slice(0, voxcountZ, 1))].cast<py::array_t<int>>());
-			RowArrayX<int> t4 = toRowArray(gridOUTPUT[py::make_tuple(lx, ly - 1, py::slice(0, voxcountZ, 1))].cast<py::array_t<int>>());
-			RowArrayX<int> t5 = toRowArray(gridOUTPUT[py::make_tuple(lx, ly + 1, py::slice(0, voxcountZ, 1))].cast<py::array_t<int>>());
-			RowArrayX<int> t6 = toRowArray(gridOUTPUT[py::make_tuple(lx + 1, ly - 1, py::slice(0, voxcountZ, 1))].cast<py::array_t<int>>());
-			RowArrayX<int> t7 = toRowArray(gridOUTPUT[py::make_tuple(lx + 1, ly, py::slice(0, voxcountZ, 1))].cast<py::array_t<int>>());
-			RowArrayX<int> t8 = toRowArray(gridOUTPUT[py::make_tuple(lx + 1, ly + 1, py::slice(0, voxcountZ, 1))].cast<py::array_t<int>>());
-			Array<int,8,Dynamic,RowMajor> ttotal(8, t1.size());
-			ttotal << t1,t2,t3,t4,t5,t6,t7,t8;
-
-			RowArrayX<int> voxelsforcorrection = ttotal.colwise().sum();
-			for (int ii = 0; ii < voxelsforcorrection.size(); ii++)
-				if (voxelsforcorrection(ii) >= 4)
-					gridOUTPUT.mutable_at(lx, ly, ii) = 1;
-		}
-		//Remove the one - pixel border surrounding the array, if this was added previously.
-		if (gridOUTPUT.shape(0) > gridCOx.size() || gridOUTPUT.shape(1) > gridCOy.size())
-			gridOUTPUT = gridOUTPUT[py::make_tuple(py::slice(1, voxcountX + 1, 1), py::slice(1, voxcountY + 1, 1), py::slice(0, voxcountZ, 1))].cast<py::array_t<int>>();
-	}
+	correctAmbiguousRays(gridOUTPUT, correctionLIST);
 	return gridOUTPUT;
 }
 
@@ -611,51 +589,7 @@ py::array_t<int> Voxel::_VOXELISE_Parallel(py::array_t<double> gx, py::array_t<d
 
 
 	}
-	//For rays where the voxelisation did not give a clear result, the ray is computed by interpolating from the surrounding rays.
-	py::ssize_t countCORRECTIONLIST = correctionLIST.size() / 2;
-	if (countCORRECTIONLIST > 0) {
-		Map<Array<int, Dynamic, 2, RowMajor>> correctionArray(correctionLIST.data(), countCORRECTIONLIST, 2);
-		//If necessary, add a one - pixel border around the x and y edges of thearray.
-		//This prevents an error if the code tries to interpolate a ray at the edge of the x, y grid.
-		if (correctionArray.colwise().minCoeff()(0) == 1 || correctionArray.colwise().maxCoeff()(0) == gridCOx.size() ||
-			correctionArray.colwise().minCoeff()(1) == 1 || correctionArray.colwise().maxCoeff()(1) == gridCOy.size()) {
-			// padding in X,Y. not in Z
-			py::array_t<int> gridpadding = py::array_t<int>((voxcountX + 2) * (voxcountY + 2) * voxcountZ).attr("reshape")(std::make_tuple(voxcountX + 2, voxcountY + 2, voxcountZ));
-			setConstValue(gridpadding, (int)0);
-			gridpadding[py::make_tuple(py::slice(1, voxcountX + 1, 1),
-				py::slice(1, voxcountY + 1, 1),
-				py::slice(0, voxcountZ, 1))] = gridOUTPUT;
-			gridOUTPUT = gridpadding;
-			correctionArray = correctionArray + 1;
-
-		}
-		for (int loopC = 0; loopC < countCORRECTIONLIST; loopC++) {
-			int lx = correctionArray(loopC, 0);
-			int ly = correctionArray(loopC, 1);
-			// Surrounding elements
-			// t1 t2 t3
-			// t4    t5
-			// t6 t7 t8
-			RowArrayX<int> t1 = toRowArray(gridOUTPUT[py::make_tuple(lx - 1, ly - 1, py::slice(0, voxcountZ, 1))].cast<py::array_t<int>>());
-			RowArrayX<int> t2 = toRowArray(gridOUTPUT[py::make_tuple(lx - 1, ly, py::slice(0, voxcountZ, 1))].cast<py::array_t<int>>());
-			RowArrayX<int> t3 = toRowArray(gridOUTPUT[py::make_tuple(lx - 1, ly + 1, py::slice(0, voxcountZ, 1))].cast<py::array_t<int>>());
-			RowArrayX<int> t4 = toRowArray(gridOUTPUT[py::make_tuple(lx, ly - 1, py::slice(0, voxcountZ, 1))].cast<py::array_t<int>>());
-			RowArrayX<int> t5 = toRowArray(gridOUTPUT[py::make_tuple(lx, ly + 1, py::slice(0, voxcountZ, 1))].cast<py::array_t<int>>());
-			RowArrayX<int> t6 = toRowArray(gridOUTPUT[py::make_tuple(lx + 1, ly - 1, py::slice(0, voxcountZ, 1))].cast<py::array_t<int>>());
-			RowArrayX<int> t7 = toRowArray(gridOUTPUT[py::make_tuple(lx + 1, ly, py::slice(0, voxcountZ, 1))].cast<py::array_t<int>>());
-			RowArrayX<int> t8 = toRowArray(gridOUTPUT[py::make_tuple(lx + 1, ly + 1, py::slice(0, voxcountZ, 1))].cast<py::array_t<int>>());
-			Array<int, 8, Dynamic, RowMajor> ttotal(8, t1.size());
-			ttotal << t1, t2, t3, t4, t5, t6, t7, t8;
-
-			RowArrayX<int> voxelsforcorrection = ttotal.colwise().sum();
-			for (int ii = 0; ii < voxelsforcorrection.size(); ii++)
-				if (voxelsforcorrection(ii) >= 4)
-					gridOUTPUT.mutable_at(lx, ly, ii) = 1;
-		}
-		//Remove the one - pixel border surrounding the array, if this was added previously.
-		if (gridOUTPUT.shape(0) > gridCOx.size() || gridOUTPUT.shape(1) > gridCOy.size())
-			gridOUTPUT = gridOUTPUT[py::make_tuple(py::slice(1, voxcountX + 1, 1), py::slice(1, voxcountY + 1, 1), py::slice(0, voxcountZ, 1))].cast<py::array_t<int>>();
-	}
+	correctAmbiguousRays(gridOUTPUT, correctionLIST);
 	return gridOUTPUT;
 }
 

@@ -411,6 +411,28 @@ def material_type(block: np.ndarray) -> int:
     return 2
 
 
+def iter_solid_load_voxels(occupancy, voxels):
+    """Keep load targets inside the original grid and on material cells."""
+    nx, ny, nz = occupancy.shape
+    for i, j, k in voxels:
+        if 0 <= i < nx and 0 <= j < ny and 0 <= k < nz and occupancy[i, j, k]:
+            yield i, j, k
+
+
+def load_masks(occupancy, load_voxels, fine, coarse_dims):
+    fx, fy, fz = fine
+    cnx, cny, _ = coarse_dims
+    masks: dict[int, np.ndarray] = {}
+    for i, j, k in iter_solid_load_voxels(occupancy, load_voxels):
+        ci, cj, ck = i // fx, j // fy, k // fz
+        eid = 1 + ci + cnx * cj + cnx * cny * ck
+        local = (i % fx) + fx * (j % fy) + fx * fy * (k % fz)
+        if eid not in masks:
+            masks[eid] = np.zeros(fx * fy * fz, dtype=np.uint8)
+        masks[eid][local] = 1
+    return masks
+
+
 def build_vgm(
     occupancy: np.ndarray,
     origin: tuple[float, float, float],
@@ -433,7 +455,7 @@ def build_vgm(
     cnz = math.ceil(nz / fz)
     padded = np.zeros((cnx * fx, cny * fy, cnz * fz), dtype=np.uint8)
     padded[:nx, :ny, :nz] = occupancy
-    fine_count = fx * fy * fz
+    load_map = load_masks(occupancy, load_voxels, (fx, fy, fz), (cnx, cny, cnz))
     # Padding adds void cells; BOX must grow with it to preserve fine voxel spacing.
     box_size = (cnx * fx * spacing[0], cny * fy * spacing[1], cnz * fz * spacing[2])
 
@@ -446,7 +468,7 @@ def build_vgm(
         "SUBCASE 1",
         "   SUBTITLE=ParaView selections",
         *(["   SPC = 2"] if constraint_voxels else []),
-        *([f"   LOAD = {force_sid + 20}"] if load_voxels else []),
+        *([f"   LOAD = {force_sid + 20}"] if load_map else []),
         "   DISPLACEMENT(SORT1,REAL)=ALL",
         "   SPCFORCES(SORT1,REAL)=ALL",
         "   STRESS(SORT1,REAL,VONMISES,BILIN)=ALL",
@@ -478,13 +500,6 @@ def build_vgm(
         values = block.ravel(order="F").astype(int).tolist()
         lines.extend(eid_vector_lines("MATB", eid, values))
 
-    load_map: dict[int, np.ndarray] = {}
-    for i, j, k in load_voxels:
-        ci, cj, ck = i // fx, j // fy, k // fz
-        eid = 1 + ci + cnx * cj + cnx * cny * ck
-        local = (i % fx) + fx * (j % fy) + fx * fy * (k % fz)
-        mask = load_map.setdefault(eid, np.zeros(fine_count, dtype=np.uint8))
-        mask[local] = 1
     load_sid = force_sid + 20
     if load_map:
         lines.extend(scalar_line("LOAD", [load_sid, "1.0", "1.0", force_sid], 8))
@@ -529,20 +544,13 @@ def write_vgm_stream(
     cnz = math.ceil(nz / fz)
     padded = np.zeros((cnx * fx, cny * fy, cnz * fz), dtype=np.uint8)
     padded[:nx, :ny, :nz] = occupancy
-    fine_count = fx * fy * fz
     # Padding adds void cells; BOX must grow with it to preserve fine voxel spacing.
     box_size = (cnx * fx * spacing[0], cny * fy * spacing[1], cnz * fz * spacing[2])
     total_coarse = cnx * cny * cnz
 
     constraint_nodes = constraint_coarse_nodes(constraint_voxels, fine, (cnx, cny, cnz), spc_node_mode)
 
-    load_map: dict[int, np.ndarray] = {}
-    for i, j, k in load_voxels:
-        ci, cj, ck = i // fx, j // fy, k // fz
-        eid = 1 + ci + cnx * cj + cnx * cny * ck
-        local = (i % fx) + fx * (j % fy) + fx * fy * (k % fz)
-        mask = load_map.setdefault(eid, np.zeros(fine_count, dtype=np.uint8))
-        mask[local] = 1
+    load_map = load_masks(occupancy, load_voxels, (fx, fy, fz), (cnx, cny, cnz))
 
     def write_lines(f, lines: list[str]) -> None:
         f.write(("\n".join(lines) + "\n").encode("ascii"))
@@ -646,7 +654,7 @@ def main() -> None:
     parser.add_argument("--spc-dof", default="123", help="SPC1 constrained DOF, e.g. 123.")
     parser.add_argument("--spc-node-mode", choices=("cell-corners", "cell-min-corner"), default="cell-corners")
     parser.add_argument("--force-sid", type=int, default=1)
-    parser.add_argument("--force", type=float, default=1000.0, help="FORCE magnitude.")
+    parser.add_argument("--force", type=float, default=1000.0, help="Force magnitude per selected solid fine cell.")
     parser.add_argument("--direction", type=vector3, default=(0.0, 0.0, -1.0), help="Force direction, e.g. 0,0,-1.")
     parser.add_argument("--material-id", type=int, default=1)
     parser.add_argument("--title", default="Voxel VGM from ParaView selections")
@@ -657,7 +665,7 @@ def main() -> None:
     occupancy, origin, spacing = read_occupancy(args.occupancy)
     dims = occupancy.shape
     constraint_voxels = selected_voxels(args.constraint_selection, dims) if args.constraint_selection else set()
-    load_voxels = selected_voxels(args.load_selection, dims) if args.load_selection else set()
+    load_voxels = set(iter_solid_load_voxels(occupancy, selected_voxels(args.load_selection, dims))) if args.load_selection else set()
     def progress(stage, done, total):
         print(f"{stage}: {done:,}/{total:,}")
 

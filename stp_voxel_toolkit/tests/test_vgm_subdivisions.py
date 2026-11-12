@@ -100,8 +100,9 @@ class SubdivisionTests(unittest.TestCase):
         for fine in ((5, 5, 5), (10, 10, 10), (2, 3, 4)):
             for stream in (False, True):
                 with self.subTest(fine=fine, stream=stream):
+                    candidates = self.loads | {(2, 3, 4), (11, 1, 1), (-1, 0, 0), (21, 10, 11)}
                     args = (self.occ, (4., 5., 6.), (.25, .5, .75), {(0, 0, 0)},
-                            self.loads, fine, "123", 1, 50., (0., 0., -1.), 1, "test")
+                            candidates, fine, "123", 1, 50., (0., 0., -1.), 1, "test")
                     if stream:
                         path = self.root / "test.vgm"
                         vgm.write_vgm_stream(path, *args)

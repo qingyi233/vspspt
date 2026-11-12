@@ -577,33 +577,12 @@ def _VOXELISE(gridCOx,gridCOy,gridCOz,meshXYZ):
     #======================================================
     # USE INTERPOLATION TO FILL IN THE RAYS WHICH COULD NOT BE VOXELISED
     #======================================================
-    #For rays where the voxelisation did not give a clear result, the ray is computed by interpolating from the surrounding rays.
-    countCORRECTIONLIST = correctionLIST.shape[0]
+    for x, y in correctionLIST:
+        # Treat out-of-grid neighbors as empty, including at the lower edge.
+        neighbors = gridOUTPUT[max(0, x - 1):x + 2, max(0, y - 1):y + 2, :]
+        votes = np.count_nonzero(neighbors, axis=(0, 1)) - gridOUTPUT[x, y, :]
+        gridOUTPUT[x, y, votes >= 4] = True
 
-    if countCORRECTIONLIST>0:
-        #If necessary, add a one-pixel border around the x and y edges of thearray.  
-        #This prevents an error if the code tries to interpolate a ray at the edge of the x,y grid.
-        if correctionLIST[:,0].min()==1 or correctionLIST[:,0].max()== gridCOx.size or correctionLIST[:,1].min()==1 or correctionLIST[:,1].max()==gridCOy.size:
-            gridOUTPUT     = np.pad(gridOUTPUT,((1,1),(1,1),(0,0)),mode='constant')
-            correctionLIST = correctionLIST + 1
-        
-        for loopC in np.arange( 0,countCORRECTIONLIST):
-            voxelsforcorrection = np.sum( np.array([gridOUTPUT[correctionLIST[loopC,0]-1,correctionLIST[loopC,1]-1,:] ,\
-                                        gridOUTPUT[correctionLIST[loopC,0]-1,correctionLIST[loopC,1],:]   ,\
-                                        gridOUTPUT[correctionLIST[loopC,0]-1,correctionLIST[loopC,1]+1,:] ,\
-                                        gridOUTPUT[correctionLIST[loopC,0],correctionLIST[loopC,1]-1,:]   ,\
-                                        gridOUTPUT[correctionLIST[loopC,0],correctionLIST[loopC,1]+1,:]   ,\
-                                        gridOUTPUT[correctionLIST[loopC,0]+1,correctionLIST[loopC,1]-1,:] ,\
-                                        gridOUTPUT[correctionLIST[loopC,0]+1,correctionLIST[loopC,1],:]   ,\
-                                        gridOUTPUT[correctionLIST[loopC,0]+1,correctionLIST[loopC,1]+1,:] ,\
-                                        ]),axis=0 ) 
-            voxelsforcorrection = (voxelsforcorrection>=4)
-            gridOUTPUT[correctionLIST[loopC,0],correctionLIST[loopC,1],voxelsforcorrection] = 1
-        #Remove the one-pixel border surrounding the array, if this was added
-        #previously.
-        if gridOUTPUT.shape[0]>gridCOx.size or gridOUTPUT.shape[1]>gridCOy.size:
-            gridOUTPUT = gridOUTPUT[1:-1,1:-1,:]
-    
     return gridOUTPUT
 
 

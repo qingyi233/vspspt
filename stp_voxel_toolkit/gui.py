@@ -9,6 +9,7 @@ Pipeline:
 
 from __future__ import annotations
 
+import math
 import queue
 import os
 import shutil
@@ -25,13 +26,15 @@ from tkinter import filedialog, messagebox, ttk
 import numpy as np
 
 from stl_surface_to_vgm import surface_stl_to_voxels
-from vtk_selection_to_vgm import read_occupancy, selected_voxels, write_vgm_stream
+from vtk_selection_to_vgm import iter_solid_load_voxels, read_occupancy, selected_voxels, write_vgm_stream
 from vgm_stats import format_statistics
 from voxel_grid import mesh_bounds, resolve_grid, validate_box
 from run_dlutfem import DEFAULT_SOLVER_BIN, DEFAULT_WORK_ROOT, run_dlutfem, safe_job_name
 
 
 ROOT = Path(__file__).resolve().parent
+FORCE_PER_CELL = "每细单元力"
+FORCE_TOTAL = "选区总力"
 PYVOXEL_DIR = ROOT / "pyvoxel_runtime"
 if str(PYVOXEL_DIR) not in sys.path:
     sys.path.insert(0, str(PYVOXEL_DIR))
@@ -52,7 +55,7 @@ else:
 @dataclass
 class RunConfig:
     step_path: Path
-    out_dir: Path
+    out_dir: Path | None
     target_cells: int
     longest_resolution: int | None
     mesh_size: float | None
@@ -381,28 +384,40 @@ def write_surface_vtk(path: Path, grid: np.ndarray, origin, spacing, q: queue.Qu
     return face_count, point_count
 
 
+def map_selection(path, occupancy, origin, spacing, label, q, *, workers=1, solid_only=False):
+    if path is None:
+        return set()
+    q.put(("status", f"正在读取{label}..."))
+    if path.suffix.lower() == ".stl":
+        result = surface_stl_to_voxels(
+            path, occupancy, origin, spacing, math.hypot(*spacing), workers=workers,
+            progress=lambda done, total, count: log_put(q, f"{label}: {done:,}/{total:,} 三角面，命中 {count:,} 体素"))
+    else:
+        result = selected_voxels(path, occupancy.shape)
+        if solid_only:
+            result = set(iter_solid_load_voxels(occupancy, result))
+    unit = "个实体细单元" if solid_only else "个体素"
+    log_put(q, f"{label}: {path}，命中 {len(result):,} {unit}")
+    return result
+
+
 def write_grid_vgm(occupancy, origin, spacing, output_path, options, q):
     """Use the same boundary mapping and VGM output for CAD and occupancy inputs."""
-    def selection(path, label):
-        if path is None:
-            return set()
-        q.put(("status", f"正在读取{label}..."))
-        if path.suffix.lower() == ".stl":
-            tolerance = float(np.linalg.norm(spacing))
-            result = surface_stl_to_voxels(
-                path, occupancy, origin, spacing, tolerance, workers=options["workers"],
-                progress=lambda done, total, count: log_put(q, f"{label}: {done:,}/{total:,} 三角面，命中 {count:,} 体素"))
-        else:
-            result = selected_voxels(path, occupancy.shape)
-        log_put(q, f"{label}: {path}，命中 {len(result):,} 体素")
-        return result
-
-    constraints = selection(options.get("constraint"), "约束选区")
-    loads = selection(options.get("load"), "载荷选区")
+    workers = options.get("workers", 1)
+    constraints = map_selection(options.get("constraint"), occupancy, origin, spacing, "约束选区", q, workers=workers)
+    loads = map_selection(options.get("load"), occupancy, origin, spacing, "载荷选区", q,
+                          workers=workers, solid_only=True)
+    force = options.get("force", 0.)
+    if options.get("force_mode") == FORCE_TOTAL:
+        if not loads:
+            raise ValueError("载荷选区未命中实体细单元，无法分配总力")
+        total_force = force
+        force /= len(loads)
+        log_put(q, f"选区总力 {total_force:.8g} 均分至 {len(loads):,} 个实体细单元，每单元 {force:.8g}")
     q.put(("status", "正在写出 VGM 并统计网格..."))
     stats = write_vgm_stream(
         output_path, occupancy, origin, spacing, constraints, loads, options["fine"],
-        options.get("spc_dof", "123"), 1, options.get("force", 0.),
+        options.get("spc_dof", "123"), 1, force,
         options.get("direction", (0., 0., -1.)), 1, "Voxel model",
         progress=lambda stage, done, total: log_put(q, f"{stage}: {done:,}/{total:,}"),
         spc_node_mode=options.get("spc_node_mode", "cell-corners"))
@@ -412,27 +427,24 @@ def write_grid_vgm(occupancy, origin, spacing, output_path, options, q):
     q.put(("solve_vgm_path", str(output_path)))
 
 
-def run_pipeline(config: RunConfig, q: queue.Queue) -> None:
-    total_start = time.time()
-    config.out_dir.mkdir(parents=True, exist_ok=True)
-
+def voxelize_model(config: RunConfig, q: queue.Queue, stl_dir: Path):
+    """Build the same occupancy grid for preview and file generation."""
     input_path = config.step_path
-    stl_path = config.out_dir / f"{input_path.stem}.stl"
-    suffix = f"r{config.longest_resolution}" if config.longest_resolution else f"target{config.target_cells}"
-
-    log_put(q, f"输入文件: {input_path}")
-    log_put(q, f"输出目录: {config.out_dir}")
+    stl_name = f"{input_path.stem}.stl"
+    stl_path = stl_dir / stl_name
+    cached_stl = config.out_dir / stl_name if config.out_dir is not None else None
 
     start = time.time()
     if input_path.suffix.lower() == ".stl":
         stl_path = input_path
         stage_put(q, "STEP 转 STL", 0.0, "输入已是 STL，跳过")
-    elif input_path.suffix.lower() in {".stp", ".step"} and config.reuse_stl and stl_path.exists() and stl_path.stat().st_size > 0:
-        log_put(q, f"复用 STL: {stl_path}")
-        stage_put(q, "STEP 转 STL", 0.0, "已复用")
     elif input_path.suffix.lower() in {".stp", ".step"}:
-        triangles = step_to_stl(input_path, stl_path, config.mesh_size, q)
-        stage_put(q, "STEP 转 STL", time.time() - start, f"{triangles:,} 个三角面, {stl_path.stat().st_size / 1048576:.2f} MB")
+        if config.reuse_stl and cached_stl and cached_stl.is_file() and cached_stl.stat().st_size > 0:
+            stl_path = cached_stl
+            stage_put(q, "STEP 转 STL", 0.0, f"复用 {stl_path}")
+        else:
+            triangles = step_to_stl(input_path, stl_path, config.mesh_size, q)
+            stage_put(q, "STEP 转 STL", time.time() - start, f"{triangles:,} 个三角面, {stl_path.stat().st_size / 1048576:.2f} MB")
     else:
         raise ValueError("输入文件必须是 .stp、.step 或 .stl")
 
@@ -462,8 +474,22 @@ def run_pipeline(config: RunConfig, q: queue.Queue) -> None:
     grid = np.asarray(grid, dtype=np.uint8)
     if grid.ndim == 4:
         grid = grid[..., 0]
-    occupied = int(grid.sum())
+    occupied = int(np.count_nonzero(grid))
     stage_put(q, "体素化", time.time() - start, f"占据体素 {occupied:,}, 填充率 {occupied / total_cells:.8f}")
+    return grid, mins, spacing, occupied
+
+
+def run_pipeline(config: RunConfig, q: queue.Queue) -> None:
+    total_start = time.time()
+    if config.out_dir is None:
+        raise ValueError("请选择输出目录")
+    config.out_dir.mkdir(parents=True, exist_ok=True)
+    input_path = config.step_path
+    suffix = f"r{config.longest_resolution}" if config.longest_resolution else f"target{config.target_cells}"
+    log_put(q, f"输入文件: {input_path}")
+    log_put(q, f"输出目录: {config.out_dir}")
+    grid, mins, spacing, _ = voxelize_model(config, q, config.out_dir)
+    nx, ny, nz = grid.shape
 
     size_tag = f"{nx}x{ny}x{nz}"
     occupancy_path = config.out_dir / f"{input_path.stem}_occupancy_{suffix}_{size_tag}.vtk"
@@ -524,6 +550,7 @@ class VoxelGui(tk.Tk):
         self.vgm_fine_z_var = tk.StringVar(value="5")
         self.vgm_fine_preset_var = tk.StringVar(value="5x5x5")
         self.vgm_spc_dof_var = tk.StringVar(value="123")
+        self.vgm_force_mode_var = tk.StringVar(value=FORCE_PER_CELL)
         self.vgm_force_var = tk.StringVar(value="1000")
         self.vgm_direction_var = tk.StringVar(value="0,0,-1")
         self.vgm_workers_var = tk.StringVar(value=str(max(1, min(8, (os.cpu_count() or 2) // 2))))
@@ -534,6 +561,10 @@ class VoxelGui(tk.Tk):
         self.solve_solver_bin_var = tk.StringVar(value=str(DEFAULT_SOLVER_BIN))
         self.solve_work_root_var = tk.StringVar(value=str(DEFAULT_WORK_ROOT))
         self.solve_refresh_bin_var = tk.BooleanVar(value=False)
+        self.grid_count_var = tk.StringVar()
+        self.load_count_var = tk.StringVar()
+        self.grid_count_revision = 0
+        self.load_count_revision = 0
         self.status_var = tk.StringVar(value="就绪")
         self._build_ui()
         for var in (self.vgm_fine_x_var, self.vgm_fine_y_var, self.vgm_fine_z_var):
@@ -541,6 +572,12 @@ class VoxelGui(tk.Tk):
         for var in (self.step_var, self.write_vgm_var, self.custom_box_var,
                     self.vgm_constraint_var, self.vgm_load_var, self.vgm_stats_var, self.vgm_fine_preset_var):
             var.trace_add("write", self._refresh_generation_ui)
+        for var in (self.step_var, self.out_var, self.grid_mode_var, self.target_var, self.resolution_var,
+                    self.mesh_size_var, self.ray_var, self.reuse_stl_var, self.use_cpp_var, self.write_vgm_var,
+                    self.custom_box_var, self.box_origin_var, self.box_size_var,
+                    self.vgm_fine_x_var, self.vgm_fine_y_var, self.vgm_fine_z_var):
+            var.trace_add("write", self._invalidate_grid_count)
+        self.vgm_load_var.trace_add("write", self._invalidate_load_count)
         self._refresh_generation_ui()
         self.after(100, self._poll_queue)
 
@@ -662,10 +699,19 @@ class VoxelGui(tk.Tk):
         ttk.Label(self.constraint_fields, text="约束自由度").pack(side="left")
         ttk.Entry(self.constraint_fields, textvariable=self.vgm_spc_dof_var, width=8).pack(side="left", padx=8)
         self.load_fields = ttk.Frame(self.vgm_frame)
-        ttk.Label(self.load_fields, text="力大小").pack(side="left")
-        ttk.Entry(self.load_fields, textvariable=self.vgm_force_var, width=12).pack(side="left", padx=8)
-        ttk.Label(self.load_fields, text="方向 X,Y,Z").pack(side="left", padx=(12, 0))
-        ttk.Entry(self.load_fields, textvariable=self.vgm_direction_var, width=18).pack(side="left", padx=8)
+        load_preview = ttk.Frame(self.load_fields)
+        load_preview.pack(fill="x")
+        self.load_count_button = ttk.Button(load_preview, text="计算命中数",
+                                            command=lambda: self._start_grid_count(include_load=True))
+        self.load_count_button.pack(side="left")
+        ttk.Label(load_preview, textvariable=self.load_count_var).pack(side="left", padx=8)
+        force_fields = ttk.Frame(self.load_fields)
+        force_fields.pack(fill="x", pady=(6, 0))
+        ttk.Combobox(force_fields, textvariable=self.vgm_force_mode_var, state="readonly",
+                     values=(FORCE_PER_CELL, FORCE_TOTAL), width=12).pack(side="left")
+        ttk.Entry(force_fields, textvariable=self.vgm_force_var, width=12).pack(side="left", padx=8)
+        ttk.Label(force_fields, text="方向 X,Y,Z").pack(side="left", padx=(12, 0))
+        ttk.Entry(force_fields, textvariable=self.vgm_direction_var, width=18).pack(side="left", padx=8)
 
         self.generation_advanced, advanced = self._advanced_group(generation)
         self.cad_advanced_fields = ttk.Frame(advanced)
@@ -706,8 +752,13 @@ class VoxelGui(tk.Tk):
 
         actions = ttk.Frame(main)
         actions.grid(row=1, column=0, sticky="ew", pady=(10, 0))
-        self.run_button = ttk.Button(actions, text="开始生成", command=self._start)
+        self.generation_actions = ttk.Frame(actions)
+        self.generation_actions.pack(side="left")
+        self.run_button = ttk.Button(self.generation_actions, text="开始生成", command=self._start)
         self.run_button.pack(side="left")
+        self.grid_count_button = ttk.Button(self.generation_actions, text="统计实体体素", command=self._start_grid_count)
+        self.grid_count_button.pack(side="left", padx=(8, 0))
+        ttk.Label(self.generation_actions, textvariable=self.grid_count_var).pack(side="left", padx=8)
         self.solve_button = ttk.Button(actions, text="开始求解", command=self._start_solve)
         ttk.Label(actions, textvariable=self.status_var).pack(side="right")
         self.notebook.bind("<<NotebookTabChanged>>", self._tab_changed)
@@ -721,16 +772,27 @@ class VoxelGui(tk.Tk):
 
     def _tab_changed(self, _event=None):
         generation = self.notebook.index("current") == 0
-        self.run_button.pack_forget()
+        self.generation_actions.pack_forget()
         self.solve_button.pack_forget()
-        (self.run_button if generation else self.solve_button).pack(side="left")
+        (self.generation_actions if generation else self.solve_button).pack(side="left")
+
+    def _invalidate_grid_count(self, variable, *_args):
+        if variable != str(self.step_var) and Path(self.step_var.get().strip()).suffix.lower() == ".vtk":
+            return
+        self.grid_count_revision += 1
+        self.grid_count_var.set("")
+        self._invalidate_load_count()
+
+    def _invalidate_load_count(self, *_args):
+        self.load_count_revision += 1
+        self.load_count_var.set("")
 
     def _grid_mode_changed(self, _event=None):
         var = self.target_var if self.grid_mode_var.get() == "目标体素数" else self.resolution_var
         self.grid_value_entry.configure(textvariable=var)
 
     def _refresh_generation_ui(self, *_args):
-        is_vtk = Path(self.step_var.get()).suffix.lower() == ".vtk"
+        is_vtk = Path(self.step_var.get().strip()).suffix.lower() == ".vtk"
         vgm = is_vtk or self.write_vgm_var.get()
         self._show(self.box_fields, self.custom_box_var.get())
         self._show(self.constraint_fields, bool(self.vgm_constraint_var.get().strip()))
@@ -792,19 +854,24 @@ class VoxelGui(tk.Tk):
             for var, value in zip((self.vgm_fine_x_var, self.vgm_fine_y_var, self.vgm_fine_z_var), label.split("x")):
                 var.set(value)
 
-    def _parse_boundary_config(self):
-        def selection(var, label):
-            text = var.get().strip()
-            if not text:
-                return None
-            path = Path(text)
-            if not path.is_file() or path.suffix.lower() not in {".vtk", ".stl"}:
-                raise ValueError(f"{label}必须是存在的 VTK 或 STL 文件")
-            return path
-        constraint = selection(self.vgm_constraint_var, "约束选区")
-        load = selection(self.vgm_load_var, "载荷选区")
-        fine = tuple(parse_positive_int(var.get(), "细分 " + label) for label, var in zip(
+    @staticmethod
+    def _selection_path(var, label):
+        text = var.get().strip()
+        if not text:
+            return None
+        path = Path(text)
+        if not path.is_file() or path.suffix.lower() not in {".vtk", ".stl"}:
+            raise ValueError(f"{label}必须是存在的 VTK 或 STL 文件")
+        return path
+
+    def _parse_fine(self):
+        return tuple(parse_positive_int(var.get(), "细分 " + label) for label, var in zip(
             ("X", "Y", "Z"), (self.vgm_fine_x_var, self.vgm_fine_y_var, self.vgm_fine_z_var)))
+
+    def _parse_boundary_config(self):
+        constraint = self._selection_path(self.vgm_constraint_var, "约束选区")
+        load = self._selection_path(self.vgm_load_var, "载荷选区")
+        fine = self._parse_fine()
         spc_dof = self.vgm_spc_dof_var.get().strip() if constraint else "123"
         if constraint and (not spc_dof or not set(spc_dof).issubset("123")):
             raise ValueError("约束自由度只能包含 1、2、3")
@@ -816,19 +883,40 @@ class VoxelGui(tk.Tk):
         direction = parse_vector3(self.vgm_direction_var.get(), "力方向") if load else (0., 0., -1.)
         if not np.isfinite(force) or not np.isfinite(direction).all():
             raise ValueError("力大小和方向必须是有限数值")
+        force_mode = self.vgm_force_mode_var.get() if load else FORCE_PER_CELL
+        if force_mode == FORCE_TOTAL:
+            scale = max(map(abs, direction))
+            if scale == 0:
+                raise ValueError("设定选区总力时，力方向必须为非零向量")
+            scaled = tuple(component / scale for component in direction)
+            length = math.hypot(*scaled)
+            direction = tuple(component / length for component in scaled)
         return dict(constraint=constraint, load=load, fine=fine, spc_dof=spc_dof,
-                    spc_node_mode=mode, workers=workers, force=force, direction=direction)
+                    spc_node_mode=mode, workers=workers, force=force, direction=direction, force_mode=force_mode)
 
     def _input_path(self, suffixes):
         path = Path(self.step_var.get().strip())
         if not path.is_file() or path.suffix.lower() not in suffixes:
             raise ValueError("请选择有效的 STEP、STL 或 occupancy VTK 文件")
-        if not self.out_var.get().strip():
-            raise ValueError("请选择输出目录")
+        if path.suffix.lower() == ".vtk" and "_surface_" in path.name.lower():
+            raise ValueError("请选择 occupancy VTK，不能使用 surface VTK")
         return path
+
+    def _output_directory(self):
+        text = self.out_var.get().strip()
+        if not text:
+            raise ValueError("请选择输出目录")
+        return Path(text)
 
     def _parse_config(self):
         step = self._input_path({".stp", ".step", ".stl"})
+        out_dir = self._output_directory()
+        if not (self.write_occ_var.get() or self.write_surface_var.get() or self.write_vgm_var.get()):
+            raise ValueError("至少选择一种输出格式")
+        options = self._parse_boundary_config() if self.write_vgm_var.get() else None
+        return self._parse_cad_grid(step, out_dir, options)
+
+    def _parse_cad_grid(self, step, out_dir, options):
         resolution = None
         target = 100_000_000
         if self.grid_mode_var.get() == "最长轴格数":
@@ -841,25 +929,20 @@ class VoxelGui(tk.Tk):
         mesh_size = float(mesh_text) if mesh_text else None
         if mesh_size is not None and (not np.isfinite(mesh_size) or mesh_size <= 0):
             raise ValueError("曲面网格尺寸必须为有限正数")
-        if not (self.write_occ_var.get() or self.write_surface_var.get() or self.write_vgm_var.get()):
-            raise ValueError("至少选择一种输出格式")
         origin = size = None
         if self.custom_box_var.get():
             origin, size = validate_box(parse_vector3(self.box_origin_var.get(), "包围盒最小角点"),
                                         parse_vector3(self.box_size_var.get(), "包围盒尺寸"))
-        options = self._parse_boundary_config() if self.write_vgm_var.get() else None
-        return RunConfig(step_path=step, out_dir=Path(self.out_var.get().strip()), target_cells=target,
+        return RunConfig(step_path=step, out_dir=out_dir, target_cells=target,
                          longest_resolution=resolution, mesh_size=mesh_size, ray=self.ray_var.get(),
                          reuse_stl=self.reuse_stl_var.get(), use_cpp=self.use_cpp_var.get(),
                          write_occupancy=self.write_occ_var.get(), write_surface=self.write_surface_var.get(),
-                         box_origin=origin, box_size=size, write_vgm=self.write_vgm_var.get(),
+                         box_origin=origin, box_size=size, write_vgm=options is not None,
                          fine=options["fine"] if options else (5, 5, 5), vgm_options=options)
 
     def _parse_vgm_config(self):
         occupancy = self._input_path({".vtk"})
-        if "_surface_" in occupancy.name.lower():
-            raise ValueError("请选择 occupancy VTK，不能使用 surface VTK")
-        return dict(occupancy=occupancy, output=Path(self.out_var.get().strip()) / f"{occupancy.stem}.vgm",
+        return dict(occupancy=occupancy, output=self._output_directory() / f"{occupancy.stem}.vgm",
                     **self._parse_boundary_config())
 
     def _begin_task(self, target, config, status, clear_statistics=True):
@@ -875,7 +958,7 @@ class VoxelGui(tk.Tk):
         if self.worker and self.worker.is_alive():
             return
         try:
-            if Path(self.step_var.get()).suffix.lower() == ".vtk":
+            if Path(self.step_var.get().strip()).suffix.lower() == ".vtk":
                 config = self._parse_vgm_config()
                 target = self._run_vgm_worker
             else:
@@ -887,6 +970,51 @@ class VoxelGui(tk.Tk):
             messagebox.showerror("参数错误", str(exc))
             return
         self._begin_task(target, config, "正在生成模型...")
+
+    def _start_grid_count(self, include_load=False):
+        if self.worker and self.worker.is_alive():
+            return
+        try:
+            model = self._input_path({".stp", ".step", ".stl", ".vtk"})
+            load = self._selection_path(self.vgm_load_var, "载荷选区") if include_load else None
+            if include_load and load is None:
+                raise ValueError("请先选择载荷选区")
+            workers = 1
+            if load is not None and load.suffix.lower() == ".stl":
+                workers = parse_positive_int(self.vgm_workers_var.get(), "曲面映射线程")
+            if model.suffix.lower() != ".vtk":
+                if IMPORT_ERROR is not None:
+                    raise ValueError(f"CAD 体素化依赖导入失败: {IMPORT_ERROR}")
+                out_text = self.out_var.get().strip()
+                options = {"fine": self._parse_fine()} if self.write_vgm_var.get() else None
+                model = self._parse_cad_grid(model, Path(out_text) if out_text else None, options)
+        except (ValueError, OSError) as exc:
+            messagebox.showerror("参数错误", str(exc))
+            return
+        self.grid_count_var.set("")
+        if include_load:
+            self.load_count_var.set("")
+        request = (model, load, workers, self.grid_count_revision, self.load_count_revision)
+        self._begin_task(self._run_grid_count_worker, request, "正在统计体素...", clear_statistics=False)
+
+    def _run_grid_count_worker(self, request):
+        model, load, workers, grid_revision, load_revision = request
+        try:
+            if isinstance(model, RunConfig):
+                with TemporaryDirectory(prefix="voxel_count_") as scratch:
+                    occupancy, origin, spacing, solid_count = voxelize_model(model, self.queue, Path(scratch))
+            else:
+                log_put(self.queue, f"读取占据场: {model}")
+                occupancy, origin, spacing = read_occupancy(model)
+                solid_count = int(np.count_nonzero(occupancy))
+            hit_count = None
+            if load is not None:
+                hits = map_selection(load, occupancy, origin, spacing, "载荷选区", self.queue,
+                                     workers=workers, solid_only=True)
+                hit_count = len(hits)
+            self.queue.put(("grid_counts", grid_revision, load_revision, solid_count, hit_count))
+        except Exception as exc:
+            self.queue.put(("error", str(exc), traceback.format_exc()))
 
     def _parse_solve_config(self):
         vgm_path = Path(self.solve_vgm_var.get().strip())
@@ -944,6 +1072,8 @@ class VoxelGui(tk.Tk):
     def _set_task_buttons(self, state):
         self.run_button.configure(state=state)
         self.solve_button.configure(state=state)
+        self.grid_count_button.configure(state=state)
+        self.load_count_button.configure(state=state)
 
     def _append_log(self, message):
         self.log_text.insert("end", message + "\n")
@@ -967,6 +1097,19 @@ class VoxelGui(tk.Tk):
                     self.generation_canvas.yview_moveto(1.0)
                 elif kind == "solve_vgm_path":
                     self.solve_vgm_var.set(item[1])
+                elif kind == "grid_counts":
+                    _, grid_revision, load_revision, solid_count, hit_count = item
+                    if grid_revision != self.grid_count_revision:
+                        self.status_var.set("网格设置已变更，请重新统计")
+                    else:
+                        self.grid_count_var.set(f"实体体素 {solid_count:,}")
+                        if hit_count is not None and load_revision != self.load_count_revision:
+                            self.status_var.set("载荷选区已变更，请重新计算命中数")
+                        else:
+                            if hit_count is not None:
+                                self.load_count_var.set(f"预计命中 {hit_count:,} 个实体细单元")
+                            self.status_var.set("统计完成")
+                    self._set_task_buttons("normal")
                 elif kind == "done":
                     self.status_var.set("生成完成")
                     self._set_task_buttons("normal")
