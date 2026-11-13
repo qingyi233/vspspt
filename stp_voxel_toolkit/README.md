@@ -43,10 +43,11 @@ py -3.14 -m venv .venv
 ..\.venv\Scripts\python.exe gui.py
 ```
 
-GUI 有两个分页：
+GUI 分页
 
 - `模型生成`：统一选择 STEP/STL 或 occupancy VTK，设置输出目录后点击“开始生成”。默认输出 VGM，也可为 CAD 输入额外选择占据场或表面 VTK。VGM 自动命名为 `<输入文件名>.vgm`。
 - `有限元求解`：读取 VGM 并调用 DLUTFEM 计算，结果写入指定目录。
+- `非设计域` 用封闭的选区 STL 从已有分析 VGM 提取实体细单元，导出独立的非设计域 VGM。
 
 CAD 输入可选择“目标体素数”或“最长轴格数”，两种方式只显示一个数值框。例如目标体素数 `100000000` / `1e8` 对应约一亿总体素。
 occupancy VTK 输入沿用原网格，自动隐藏体素化和包围盒设置。
@@ -85,6 +86,21 @@ VTK 使用世界坐标；VGM 的 `BOX` 定义局部网格尺寸，原点保存�
 使用同一份 occupancy VTK 时，细体素间距和实体细体素数量保持不变，仅改变粗单元分组。
 不足整除的边界补空，BOX 外包尺寸相应增大，不会压缩原有几何。
 粗节点及其约束映射会随粗网格改变，因此不同细分的结果不一定完全相同。
+
+### 从分析 VGM 提取非设计域
+
+在“非设计域”页选择分析 VGM 和封闭的体积 STL。STL 应与分析模型使用同一世界坐标和单位。工具沿用分析 VGM 的 `BOX`、粗单元编号和粗单元内的细单元顺序，选出中心落入 STL 的实体细单元。落在空体素或分析网格外的命中会从结果中排除。
+
+分析 VGM 含 `$ ORIGIN` 时会自动读取原点。缺少该注释时，填写原分析网格的世界坐标最小角点，可从对应的 `*.stats.json` 取 `origin`。输出留空时，在分析文件同目录生成 `<分析文件名>_NonDesignDomain_subset.vgm`。运行日志会列出选中的粗、细单元数以及被排除的几何命中数。
+
+也可以从工具包目录运行命令
+
+```powershell
+python non_design_to_vgm.py --analysis All.vgm --geometry NonDesignDomain.stl `
+  --output output/All_NonDesignDomain_subset.vgm
+```
+
+分析 VGM 缺少 `$ ORIGIN` 时，可用 `--origin X Y Z` 提供实际原点。
 
 ## 命令行使用
 

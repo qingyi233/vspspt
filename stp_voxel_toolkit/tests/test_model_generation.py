@@ -311,7 +311,7 @@ class GenerationTests(unittest.TestCase):
         app.withdraw()
         self.addCleanup(app.destroy)
         self.assertEqual([app.notebook.tab(tab, "text") for tab in app.notebook.tabs()],
-                         ["模型生成", "有限元求解"])
+                         ["模型生成", "有限元求解", "非设计域"])
         app.out_var.set(str(self.root))
         app.step_var.set(str(self.cube_file()))
         app.grid_mode_var.set("最长轴格数")

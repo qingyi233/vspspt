@@ -25,6 +25,7 @@ from tkinter import filedialog, messagebox, ttk
 
 import numpy as np
 
+from non_design_to_vgm import select_non_design
 from stl_surface_to_vgm import surface_stl_to_voxels
 from vtk_selection_to_vgm import iter_solid_load_voxels, read_occupancy, selected_voxels, write_vgm_stream
 from vgm_stats import format_statistics
@@ -561,6 +562,10 @@ class VoxelGui(tk.Tk):
         self.solve_solver_bin_var = tk.StringVar(value=str(DEFAULT_SOLVER_BIN))
         self.solve_work_root_var = tk.StringVar(value=str(DEFAULT_WORK_ROOT))
         self.solve_refresh_bin_var = tk.BooleanVar(value=False)
+        self.non_design_analysis_var = tk.StringVar()
+        self.non_design_geometry_var = tk.StringVar()
+        self.non_design_output_var = tk.StringVar()
+        self.non_design_origin_var = tk.StringVar()
         self.grid_count_var = tk.StringVar()
         self.load_count_var = tk.StringVar()
         self.grid_count_revision = 0
@@ -639,6 +644,7 @@ class VoxelGui(tk.Tk):
         generation = self._scroll_page(self.notebook, "模型生成")
         self.generation_canvas = generation.master
         solve = self._scroll_page(self.notebook, "有限元求解")
+        non_design = self._scroll_page(self.notebook, "非设计域")
 
         files = ttk.LabelFrame(generation, text="输入与输出", padding=10)
         files.pack(fill="x")
@@ -737,7 +743,8 @@ class VoxelGui(tk.Tk):
 
         solver_files = ttk.LabelFrame(solve, text="求解文件", padding=10)
         solver_files.pack(fill="x")
-        self._path_row(solver_files, 0, "输入 VGM", self.solve_vgm_var, self._browse_solve_vgm)
+        self._path_row(solver_files, 0, "输入 VGM", self.solve_vgm_var,
+                       lambda: self._browse_file(self.solve_vgm_var, ("VGM 文件", "*.vgm")))
         self._path_row(solver_files, 1, "结果目录", self.solve_out_var,
                        lambda: self._browse_directory(self.solve_out_var))
         _, advanced = self._advanced_group(solve)
@@ -750,6 +757,19 @@ class VoxelGui(tk.Tk):
         ttk.Checkbutton(advanced, text="刷新求解器运行库", variable=self.solve_refresh_bin_var).grid(
             row=3, column=0, columnspan=3, sticky="w", pady=(6, 0))
 
+        non_design_files = ttk.LabelFrame(non_design, text="非设计域选区", padding=10)
+        non_design_files.pack(fill="x")
+        self._path_row(non_design_files, 0, "分析 VGM", self.non_design_analysis_var,
+                       lambda: self._browse_file(self.non_design_analysis_var, ("VGM 文件", "*.vgm")))
+        self._path_row(non_design_files, 1, "封闭选区 STL", self.non_design_geometry_var,
+                       lambda: self._browse_file(self.non_design_geometry_var, ("STL 文件", "*.stl")))
+        self._path_row(non_design_files, 2, "输出 VGM", self.non_design_output_var, self._browse_non_design_output)
+        ttk.Label(non_design_files, text="网格原点 X,Y,Z").grid(row=3, column=0, sticky="w", pady=4)
+        ttk.Entry(non_design_files, textvariable=self.non_design_origin_var, width=28).grid(
+            row=3, column=1, sticky="w", padx=8)
+        ttk.Label(non_design_files, text="仅在分析 VGM 缺少 $ ORIGIN 时填写原点。输出留空时保存到分析 VGM 同目录。",
+                  foreground="#555555").grid(row=4, column=0, columnspan=3, sticky="w", pady=(4, 0))
+
         actions = ttk.Frame(main)
         actions.grid(row=1, column=0, sticky="ew", pady=(10, 0))
         self.generation_actions = ttk.Frame(actions)
@@ -760,6 +780,7 @@ class VoxelGui(tk.Tk):
         self.grid_count_button.pack(side="left", padx=(8, 0))
         ttk.Label(self.generation_actions, textvariable=self.grid_count_var).pack(side="left", padx=8)
         self.solve_button = ttk.Button(actions, text="开始求解", command=self._start_solve)
+        self.non_design_button = ttk.Button(actions, text="提取非设计域", command=self._start_non_design)
         ttk.Label(actions, textvariable=self.status_var).pack(side="right")
         self.notebook.bind("<<NotebookTabChanged>>", self._tab_changed)
         log_frame = ttk.LabelFrame(main, text="运行日志", padding=8)
@@ -771,10 +792,10 @@ class VoxelGui(tk.Tk):
         self.log_text.configure(yscrollcommand=scrollbar.set)
 
     def _tab_changed(self, _event=None):
-        generation = self.notebook.index("current") == 0
-        self.generation_actions.pack_forget()
-        self.solve_button.pack_forget()
-        (self.generation_actions if generation else self.solve_button).pack(side="left")
+        actions = (self.generation_actions, self.solve_button, self.non_design_button)
+        for action in actions:
+            action.pack_forget()
+        actions[self.notebook.index("current")].pack(side="left")
 
     def _invalidate_grid_count(self, variable, *_args):
         if variable != str(self.step_var) and Path(self.step_var.get().strip()).suffix.lower() == ".vtk":
@@ -838,10 +859,15 @@ class VoxelGui(tk.Tk):
         if path:
             variable.set(path)
 
-    def _browse_solve_vgm(self):
-        path = filedialog.askopenfilename(filetypes=[("VGM 文件", "*.vgm"), ("所有文件", "*.*")])
+    def _browse_file(self, variable, filetype):
+        path = filedialog.askopenfilename(filetypes=[filetype, ("所有文件", "*.*")])
         if path:
-            self.solve_vgm_var.set(path)
+            variable.set(path)
+
+    def _browse_non_design_output(self):
+        path = filedialog.asksaveasfilename(defaultextension=".vgm", filetypes=[("VGM 文件", "*.vgm")])
+        if path:
+            self.non_design_output_var.set(path)
 
     def _sync_fine_preset(self, *_args):
         label = "x".join(var.get().strip() for var in
@@ -1042,6 +1068,28 @@ class VoxelGui(tk.Tk):
             return
         self._begin_task(self._run_solve_worker, config, "正在求解...", clear_statistics=False)
 
+    def _start_non_design(self):
+        if self.worker and self.worker.is_alive():
+            return
+        analysis = Path(self.non_design_analysis_var.get().strip())
+        geometry = Path(self.non_design_geometry_var.get().strip())
+        output_text = self.non_design_output_var.get().strip()
+        origin_text = self.non_design_origin_var.get().strip()
+        try:
+            if not analysis.is_file() or analysis.suffix.lower() != ".vgm":
+                raise ValueError("请选择有效的分析 VGM")
+            if not geometry.is_file() or geometry.suffix.lower() != ".stl":
+                raise ValueError("请选择有效的封闭选区 STL")
+            output = Path(output_text) if output_text else analysis.with_name(f"{analysis.stem}_NonDesignDomain_subset.vgm")
+            if output.suffix.lower() != ".vgm":
+                raise ValueError("输出文件必须使用 .vgm 扩展名")
+            origin = parse_vector3(origin_text, "网格原点") if origin_text else None
+        except ValueError as exc:
+            messagebox.showerror("参数错误", str(exc))
+            return
+        self._begin_task(self._run_non_design_worker, (analysis, geometry, output, origin),
+                         "正在提取非设计域...", clear_statistics=False)
+
     def _run_worker(self, config):
         try:
             run_pipeline(config, self.queue)
@@ -1069,9 +1117,23 @@ class VoxelGui(tk.Tk):
         except Exception as exc:
             self.queue.put(("error", str(exc), traceback.format_exc()))
 
+    def _run_non_design_worker(self, config):
+        analysis, geometry, output, origin = config
+        try:
+            result = select_non_design(analysis, geometry, output, origin=origin,
+                                       progress=lambda message: log_put(self.queue, message))
+            log_put(self.queue, f"选中 {result['selected_cells']:,} 个实体细单元，"
+                    f"分布在 {result['selected_coarse_cells']:,} 个粗单元中。"
+                    f"已排除分析实体以外的 {result['excluded_cells']:,} 个几何命中单元。")
+            log_put(self.queue, f"非设计域已保存到 {output}")
+            self.queue.put(("non_design_done",))
+        except Exception as exc:
+            self.queue.put(("error", str(exc), traceback.format_exc()))
+
     def _set_task_buttons(self, state):
         self.run_button.configure(state=state)
         self.solve_button.configure(state=state)
+        self.non_design_button.configure(state=state)
         self.grid_count_button.configure(state=state)
         self.load_count_button.configure(state=state)
 
@@ -1112,6 +1174,9 @@ class VoxelGui(tk.Tk):
                     self._set_task_buttons("normal")
                 elif kind == "done":
                     self.status_var.set("生成完成")
+                    self._set_task_buttons("normal")
+                elif kind == "non_design_done":
+                    self.status_var.set("非设计域已提取")
                     self._set_task_buttons("normal")
                 elif kind == "solve_done":
                     _, seconds, returncode, output_dir = item
