@@ -458,6 +458,26 @@ class Voxel:
 
 
 
+def _ray_hit_depths(triangles, x, y, depth_origin, tolerance):
+    """Intersect a Z ray using projected barycentric coordinates and local depth."""
+    a = triangles[:, :, 0]
+    b = triangles[:, :, 1] - a
+    c = triangles[:, :, 2] - a
+    determinant = b[:, 0] * c[:, 1] - b[:, 1] * c[:, 0]
+    crosses_plane = determinant != 0
+    a, b, c = a[crosses_plane], b[crosses_plane], c[crosses_plane]
+    determinant = determinant[crosses_plane]
+    px, py = x - a[:, 0], y - a[:, 1]
+    u = (px * c[:, 1] - py * c[:, 0]) / determinant
+    v = (b[:, 0] * py - b[:, 1] * px) / determinant
+    inside = (u >= -1e-12) & (v >= -1e-12) & (u + v <= 1 + 1e-12)
+    hits = (a[inside, 2] - depth_origin) + u[inside] * b[inside, 2] + v[inside] * c[inside, 2]
+    hits.sort()
+    # Adjacent triangles can report the same crossing on their shared edge.
+    distinct = np.diff(hits, prepend=-np.inf) > tolerance
+    return hits[distinct]
+
+
 def _VOXELISE(gridCOx,gridCOy,gridCOz,meshXYZ):
     # Count the number of voxels in each direction:
     voxcountX = gridCOx.size
@@ -474,6 +494,8 @@ def _VOXELISE(gridCOx,gridCOy,gridCOz,meshXYZ):
     meshYmax = meshXYZ[:,1,:].max()
     meshZmin = meshXYZ[:,2,:].min()
     meshZmax = meshXYZ[:,2,:].max()
+    depths = gridCOz - meshZmin
+    hit_tolerance = 32 * np.finfo(float).eps * (meshZmax - meshZmin)
 
     # Identify the min and max x,y coordinates (pixels) of the mesh:
     meshXminp = np.where( np.abs(gridCOx-meshXmin)==np.abs(gridCOx-meshXmin).min() )[0][0]
@@ -494,7 +516,7 @@ def _VOXELISE(gridCOx,gridCOy,gridCOz,meshXYZ):
     #======================================================
     # VOXELISE THE MESH
     #======================================================
-    correctionLIST = np.zeros((0,2),dtype=int) # N x 2
+    correctionLIST = []
     # Loop through each x,y pixel.
     # The mesh will be voxelised by passing rays in the z-direction through
     # each x,y pixel, and finding the locations where the rays cross the mesh.
@@ -506,77 +528,16 @@ def _VOXELISE(gridCOx,gridCOy,gridCOz,meshXYZ):
             # - 1b - Find which mesh facets could possibly be crossed by the ray:
             possibleCROSSLIST = possibleCROSSLISTy[ (meshXYZmin[possibleCROSSLISTy,0]<=gridCOx[loopX]) & (meshXYZmax[possibleCROSSLISTy,0]>=gridCOx[loopX]) ]
 
-            #Only continue the analysis if some nearby facets were actually identified
-            if possibleCROSSLIST.size > 0:
-                # - 2 - For each facet, check if the ray really does cross the facet rather than just passing it close-by:
-                facetCROSSLIST = np.zeros(0,dtype=int)
-                #----------
-                # - 2 - Check for crossed facets:
-                #----------
-                #Only continue the analysis if some nearby facets were actually identified
-                if possibleCROSSLIST.size > 0:  
-                    # 判断给出的坐标是否在闭合的三角形中，向量叉积法
-                    for face in possibleCROSSLIST.flatten():
-                        ax, ay = meshXYZ[face, :2, 0]
-                        bx, by = meshXYZ[face, :2, 1] - (ax, ay)
-                        cx, cy = meshXYZ[face, :2, 2] - (ax, ay)
-                        determinant = bx * cy - by * cx
-                        if determinant == 0:
-                            continue
-                        px, py = gridCOx[loopX] - ax, gridCOy[loopY] - ay
-                        u = (px * cy - py * cx) / determinant
-                        v = (bx * py - by * px) / determinant
-                        if u >= -1e-12 and v >= -1e-12 and u + v <= 1 + 1e-12:
-                            facetCROSSLIST = np.append(facetCROSSLIST, face)
+            if possibleCROSSLIST.size == 0:
+                continue
+            hits = _ray_hit_depths(meshXYZ[possibleCROSSLIST], gridCOx[loopX], gridCOy[loopY],
+                                   meshZmin, hit_tolerance)
+            if hits.size % 2:
+                correctionLIST.append((loopX, loopY))
+                continue
+            for entry, exit in zip(hits[::2], hits[1::2]):
+                gridOUTPUT[loopX, loopY, (entry < depths) & (depths < exit)] = 1
 
-                    #----------
-                    # - 3 - Find the z coordinate of the locations where the ray crosses each facet or vertex:
-                    #----------
-                    gridCOzCROSS = np.zeros(facetCROSSLIST.shape)
-                    for loopFINDZ in facetCROSSLIST:
-                        # METHOD:
-                        # 1. Define the equation describing the plane of the facet.  For a more detailed outline of the maths, see:
-                        # http://local.wasp.uwa.edu.au/~pbourke/geometry/planeeq/
-                        #    Ax + By + Cz + D = 0
-                        #    where  A = y0 (z1 - z2) + y1 (z2 - z0) + y2 (z0 - z1)
-                        #           B = z0 (x1 - x2) + z1 (x2 - x0) + z2 (x0 - x1)
-                        #           C = x0 (y1 - y2) + x1 (y2 - y0) + x2 (y0 - y1)
-                        #           D = - x0 (y1 z2 - y2 z1) - x1 (y2 z0 - y0 z2) - x2 (y0 z1 - y1 z0)
-                        # 2. For the x and y coordinates of the ray, solve these equations to find the z coordinate in this plane.
-
-                        planecoA = meshXYZ[loopFINDZ,1,0]*(meshXYZ[loopFINDZ,2,1]-meshXYZ[loopFINDZ,2,2]) + meshXYZ[loopFINDZ,1,1]*(meshXYZ[loopFINDZ,2,2]-meshXYZ[loopFINDZ,2,0]) + meshXYZ[loopFINDZ,1,2]*(meshXYZ[loopFINDZ,2,0]-meshXYZ[loopFINDZ,2,1])
-                        planecoB = meshXYZ[loopFINDZ,2,0]*(meshXYZ[loopFINDZ,0,1]-meshXYZ[loopFINDZ,0,2]) + meshXYZ[loopFINDZ,2,1]*(meshXYZ[loopFINDZ,0,2]-meshXYZ[loopFINDZ,0,0]) + meshXYZ[loopFINDZ,2,2]*(meshXYZ[loopFINDZ,0,0]-meshXYZ[loopFINDZ,0,1]) 
-                        planecoC = meshXYZ[loopFINDZ,0,0]*(meshXYZ[loopFINDZ,1,1]-meshXYZ[loopFINDZ,1,2]) + meshXYZ[loopFINDZ,0,1]*(meshXYZ[loopFINDZ,1,2]-meshXYZ[loopFINDZ,1,0]) + meshXYZ[loopFINDZ,0,2]*(meshXYZ[loopFINDZ,1,0]-meshXYZ[loopFINDZ,1,1])
-                        planecoD = - meshXYZ[loopFINDZ,0,0]*(meshXYZ[loopFINDZ,1,1]*meshXYZ[loopFINDZ,2,2]-meshXYZ[loopFINDZ,1,2]*meshXYZ[loopFINDZ,2,1]) - meshXYZ[loopFINDZ,0,1]*(meshXYZ[loopFINDZ,1,2]*meshXYZ[loopFINDZ,2,0]-meshXYZ[loopFINDZ,1,0]*meshXYZ[loopFINDZ,2,2]) - meshXYZ[loopFINDZ,0,2]*(meshXYZ[loopFINDZ,1,0]*meshXYZ[loopFINDZ,2,1]-meshXYZ[loopFINDZ,1,1]*meshXYZ[loopFINDZ,2,0])
-                        
-                        if abs(planecoC) < 1e-14: 
-                            planecoC=0
-                        else:
-                            gridCOzCROSS[facetCROSSLIST==loopFINDZ] = (- planecoD - planecoA*gridCOx[loopX] - planecoB*gridCOy[loopY]) / planecoC
-
-                    #Remove values of gridCOzCROSS which are outside of the mesh limits (including a 1e-12 margin for error).
-                    gridCOzCROSS = gridCOzCROSS[ (gridCOzCROSS>=meshZmin-1e-12) & (gridCOzCROSS<=meshZmax+1e-12) ]
-                    #Round gridCOzCROSS to remove any rounding errors, and take only the unique values:
-                    gridCOzCROSS = np.round(gridCOzCROSS*1e12)/1e12
-                    gridCOzCROSS = np.unique(gridCOzCROSS)
-                    # print(gridCOzCROSS)
-
-                    #----------
-                    # - 4 - Label as being inside the mesh all the voxels that the ray passes through after crossing one facet before crossing another facet:
-                    #----------
-                    # Only rays which cross an even number of facets are voxelised
-                    if gridCOzCROSS.size % 2 == 0:  
-                        for loopASSIGN in np.arange( 1, (gridCOzCROSS.size/2)+1,dtype=int ):
-                            voxelsINSIDE = ((gridCOz>gridCOzCROSS[2*loopASSIGN-2]) & (gridCOz<gridCOzCROSS[2*loopASSIGN-1]))
-                            gridOUTPUT[loopX,loopY,voxelsINSIDE] = 1
-
-                    elif gridCOzCROSS.size > 0:
-                        # Remaining rays which meet the mesh in some way are not voxelised, but are labelled for correction later.
-                        correctionLIST = np.insert( correctionLIST, correctionLIST.shape[0], [[loopX,loopY]], axis=0 )
-
-    #======================================================
-    # USE INTERPOLATION TO FILL IN THE RAYS WHICH COULD NOT BE VOXELISED
-    #======================================================
     for x, y in correctionLIST:
         # Treat out-of-grid neighbors as empty, including at the lower edge.
         neighbors = gridOUTPUT[max(0, x - 1):x + 2, max(0, y - 1):y + 2, :]
@@ -636,68 +597,21 @@ def _ray_1direction(loopY,gridshape,meshXYZ,gridCOx,gridCOy,gridCOz,meshXminp,me
     meshXYZmax = np.max(meshXYZ,axis=2)
     meshZmin = meshXYZ[:,2,:].min()
     meshZmax = meshXYZ[:,2,:].max()
+    depths = gridCOz - meshZmin
+    hit_tolerance = 32 * np.finfo(float).eps * (meshZmax - meshZmin)
     gridTemp = np.zeros(gridshape, dtype=int)
     coory = gridCOy[loopY]
     possibleCROSSLISTy = np.where( (meshXYZmin[:,1]<=coory) & (meshXYZmax[:,1]>=coory) )[0]
-    correctionLIST = np.zeros((0,2),dtype=int) # N x 2
     for loopX in range(meshXminp,meshXmaxp+1):       
         # - 1b - Find which mesh facets could possibly be crossed by the ray:
         coorx = gridCOx[loopX]
         possibleCROSSLIST = possibleCROSSLISTy[ (meshXYZmin[possibleCROSSLISTy,0]<=coorx) & (meshXYZmax[possibleCROSSLISTy,0]>=coorx) ]
-        if possibleCROSSLIST.size > 0:
-            # - 2 - For each facet, check if the ray really does cross the facet rather than just passing it close-by:
-            facetCROSSLIST = np.zeros(0,dtype=int)
-            if possibleCROSSLIST.size > 0:
-                for loopCHECKFACET in possibleCROSSLIST.flatten():
-                    #Check if ray crosses the facet.  This method is much (>>10 times) faster than using the built-in function 'inpolygon'.
-                    #Taking each edge of the facet in turn, check if the ray is on the same side as the opposing vertex.
-                    Y1predicted = meshXYZ[loopCHECKFACET,1,1] - ((meshXYZ[loopCHECKFACET,1,1]-meshXYZ[loopCHECKFACET,1,2]) * (meshXYZ[loopCHECKFACET,0,1]-meshXYZ[loopCHECKFACET,0,0])/(meshXYZ[loopCHECKFACET,0,1]-meshXYZ[loopCHECKFACET,0,2]))
-                    YRpredicted = meshXYZ[loopCHECKFACET,1,1] - ((meshXYZ[loopCHECKFACET,1,1]-meshXYZ[loopCHECKFACET,1,2]) * (meshXYZ[loopCHECKFACET,0,1]-coorx)/(meshXYZ[loopCHECKFACET,0,1]-meshXYZ[loopCHECKFACET,0,2]))
-                    
-                    if (Y1predicted > meshXYZ[loopCHECKFACET,1,0] and YRpredicted > coory) or (Y1predicted < meshXYZ[loopCHECKFACET,1,0] and YRpredicted < coory):
-                        #The ray is on the same side of the 2-3 edge as the 1st vertex.
-                        Y2predicted = meshXYZ[loopCHECKFACET,1,2] - ((meshXYZ[loopCHECKFACET,1,2]-meshXYZ[loopCHECKFACET,1,0]) * (meshXYZ[loopCHECKFACET,0,2]-meshXYZ[loopCHECKFACET,0,1])/(meshXYZ[loopCHECKFACET,0,2]-meshXYZ[loopCHECKFACET,0,0]))
-                        YRpredicted = meshXYZ[loopCHECKFACET,1,2] - ((meshXYZ[loopCHECKFACET,1,2]-meshXYZ[loopCHECKFACET,1,0]) * (meshXYZ[loopCHECKFACET,0,2]-coorx)/(meshXYZ[loopCHECKFACET,0,2]-meshXYZ[loopCHECKFACET,0,0]))
-                        
-                        if (Y2predicted > meshXYZ[loopCHECKFACET,1,1] and YRpredicted > coory) or (Y2predicted < meshXYZ[loopCHECKFACET,1,1] and YRpredicted < coory):
-                            #The ray is on the same side of the 3-1 edge as the 2nd vertex.
-                            Y3predicted = meshXYZ[loopCHECKFACET,1,0] - ((meshXYZ[loopCHECKFACET,1,0]-meshXYZ[loopCHECKFACET,1,1]) * (meshXYZ[loopCHECKFACET,0,0]-meshXYZ[loopCHECKFACET,0,2])/(meshXYZ[loopCHECKFACET,0,0]-meshXYZ[loopCHECKFACET,0,1]))
-                            YRpredicted = meshXYZ[loopCHECKFACET,1,0] - ((meshXYZ[loopCHECKFACET,1,0]-meshXYZ[loopCHECKFACET,1,1]) * (meshXYZ[loopCHECKFACET,0,0]-coorx)/(meshXYZ[loopCHECKFACET,0,0]-meshXYZ[loopCHECKFACET,0,1]))
-                            
-                            if (Y3predicted > meshXYZ[loopCHECKFACET,1,2] and YRpredicted > coory) or (Y3predicted < meshXYZ[loopCHECKFACET,1,2] and YRpredicted < coory):
-                                #The ray is on the same side of the 1-2 edge as the 3rd vertex.
-                                #The ray passes through the facet since it is on the correct side of all 3 edges
-                                facetCROSSLIST = np.insert(facetCROSSLIST,facetCROSSLIST.size,loopCHECKFACET,0)
-                
-                #----------
-                # - 3 - Find the z coordinate of the locations where the ray crosses each facet or vertex:
-                #----------
-                gridCOzCROSS = np.zeros(facetCROSSLIST.shape)
-                for loopFINDZ in facetCROSSLIST:
-                    planecoA = meshXYZ[loopFINDZ,1,0]*(meshXYZ[loopFINDZ,2,1]-meshXYZ[loopFINDZ,2,2]) + meshXYZ[loopFINDZ,1,1]*(meshXYZ[loopFINDZ,2,2]-meshXYZ[loopFINDZ,2,0]) + meshXYZ[loopFINDZ,1,2]*(meshXYZ[loopFINDZ,2,0]-meshXYZ[loopFINDZ,2,1])
-                    planecoB = meshXYZ[loopFINDZ,2,0]*(meshXYZ[loopFINDZ,0,1]-meshXYZ[loopFINDZ,0,2]) + meshXYZ[loopFINDZ,2,1]*(meshXYZ[loopFINDZ,0,2]-meshXYZ[loopFINDZ,0,0]) + meshXYZ[loopFINDZ,2,2]*(meshXYZ[loopFINDZ,0,0]-meshXYZ[loopFINDZ,0,1]) 
-                    planecoC = meshXYZ[loopFINDZ,0,0]*(meshXYZ[loopFINDZ,1,1]-meshXYZ[loopFINDZ,1,2]) + meshXYZ[loopFINDZ,0,1]*(meshXYZ[loopFINDZ,1,2]-meshXYZ[loopFINDZ,1,0]) + meshXYZ[loopFINDZ,0,2]*(meshXYZ[loopFINDZ,1,0]-meshXYZ[loopFINDZ,1,1])
-                    planecoD = - meshXYZ[loopFINDZ,0,0]*(meshXYZ[loopFINDZ,1,1]*meshXYZ[loopFINDZ,2,2]-meshXYZ[loopFINDZ,1,2]*meshXYZ[loopFINDZ,2,1]) - meshXYZ[loopFINDZ,0,1]*(meshXYZ[loopFINDZ,1,2]*meshXYZ[loopFINDZ,2,0]-meshXYZ[loopFINDZ,1,0]*meshXYZ[loopFINDZ,2,2]) - meshXYZ[loopFINDZ,0,2]*(meshXYZ[loopFINDZ,1,0]*meshXYZ[loopFINDZ,2,1]-meshXYZ[loopFINDZ,1,1]*meshXYZ[loopFINDZ,2,0])
-
-                    if abs(planecoC) < 1e-14: 
-                        planecoC=0
-                    else:
-                        gridCOzCROSS[facetCROSSLIST==loopFINDZ] = (- planecoD - planecoA*coorx - planecoB*coory) / planecoC
-
-                #Remove values of gridCOzCROSS which are outside of the mesh limits (including a 1e-12 margin for error).
-                gridCOzCROSS = gridCOzCROSS[ (gridCOzCROSS>=meshZmin-1e-12) & (gridCOzCROSS<=meshZmax+1e-12) ]
-                #Round gridCOzCROSS to remove any rounding errors, and take only the unique values:
-                gridCOzCROSS = np.round(gridCOzCROSS*1e12)/1e12
-                gridCOzCROSS = np.unique(gridCOzCROSS)
-
-                if gridCOzCROSS.size % 2 == 0:  
-                    for loopASSIGN in np.arange( 1, (gridCOzCROSS.size/2)+1,dtype=int ):
-                        voxelsINSIDE = ((gridCOz>gridCOzCROSS[2*loopASSIGN-2]) & (gridCOz<gridCOzCROSS[2*loopASSIGN-1]))
-                        gridTemp[loopX,loopY,voxelsINSIDE] = 1
-
-                elif gridCOzCROSS.size > 0:
-                    # Remaining rays which meet the mesh in some way are not voxelised, but are labelled for correction later.
-                    correctionLIST = np.insert( correctionLIST, correctionLIST.shape[0], [[loopX,loopY]], axis=0 )
+        if possibleCROSSLIST.size == 0:
+            continue
+        hits = _ray_hit_depths(meshXYZ[possibleCROSSLIST], coorx, coory, meshZmin, hit_tolerance)
+        if hits.size % 2 == 0:
+            for entry, exit in zip(hits[::2], hits[1::2]):
+                gridTemp[loopX, loopY, (entry < depths) & (depths < exit)] = 1
     return gridTemp
 
 

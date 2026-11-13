@@ -1,9 +1,11 @@
 #include "Voxel.h"
 #include <iomanip>
 #include <cmath>
+#include <limits>
 
-// Inclusive barycentric test: shared triangle edges must not leave holes in the grid.
-static bool rayCrossesTriangle(const py::array_t<double>& mesh, int face, double x, double y)
+// Compute the hit in a local frame to avoid cancellation in the world-space plane equation.
+static bool rayIntersectionDepth(const py::array_t<double>& mesh, int face, double x, double y,
+                                 double depthOrigin, double& depth)
 {
     double ax = mesh.at(face, 0, 0), ay = mesh.at(face, 1, 0);
     double bx = mesh.at(face, 0, 1) - ax, by = mesh.at(face, 1, 1) - ay;
@@ -12,7 +14,26 @@ static bool rayCrossesTriangle(const py::array_t<double>& mesh, int face, double
     if (determinant == 0.0) return false; // Parallel ray or degenerate projection.
     double u = ((x - ax) * cy - (y - ay) * cx) / determinant;
     double v = (bx * (y - ay) - by * (x - ax)) / determinant;
-    return u >= -1e-12 && v >= -1e-12 && u + v <= 1.0 + 1e-12;
+    if (u < -1e-12 || v < -1e-12 || u + v > 1.0 + 1e-12)
+        return false;
+    const double az = mesh.at(face, 2, 0);
+    depth = (az - depthOrigin) + u * (mesh.at(face, 2, 1) - az) + v * (mesh.at(face, 2, 2) - az);
+    return true;
+}
+
+static void mergeCoincidentHits(std::vector<double>& hits, double tolerance)
+{
+    if (hits.empty()) return;
+    std::sort(hits.begin(), hits.end());
+    size_t count = 1;
+    double previous = hits.front();
+    for (size_t index = 1; index < hits.size(); ++index) {
+        const double depth = hits[index];
+        if (depth - previous > tolerance)
+            hits[count++] = depth;
+        previous = depth;
+    }
+    hits.resize(count);
 }
 
 static void correctAmbiguousRays(py::array_t<int>& grid, const std::vector<int>& rays)
@@ -331,6 +352,10 @@ py::array_t<int> Voxel::_VOXELISE(py::array_t<double> gx, py::array_t<double> gy
 	meshZmin = meshXYZ[py::make_tuple(py::slice(0, N, 1), 2, py::slice(0, 3, 1))].attr("min")().cast<double>();
 	meshZmax = meshXYZ[py::make_tuple(py::slice(0, N, 1), 2, py::slice(0, 3, 1))].attr("max")().cast<double>();
 
+	// Grid samples and hits use the same local depth, independent of world position.
+	gridCOz -= meshZmin;
+	const double hitTolerance = 32 * std::numeric_limits<double>::epsilon() * (meshZmax - meshZmin);
+
 	// Identify the min and max x, y coordinates(pixels) of the mesh :
 	py::ssize_t meshXminp, meshXmaxp, meshYminp, meshYmaxp, temp, row;
 	RowArrayX<double> gxmin = (gridCOx - meshXmin).abs();
@@ -379,67 +404,23 @@ py::array_t<int> Voxel::_VOXELISE(py::array_t<double> gx, py::array_t<double> gy
 					possibleCROSSLIST.push_back(possibleCROSSLISTy.at(j));
 			}
 
-			if (possibleCROSSLIST.size() > 0) {
-				// -2 - For each facet, check if the ray really does cross the facet rather than just passing it close - by:
-				std::vector<int> facetCROSSLIST;
-				// - 2 - Check for crossed facets
-				//Only continue the analysis if some nearby facets were actually identified
-				double planecoA, planecoB, planecoC, planecoD;
-				for (int loopCHECKFACET : possibleCROSSLIST) {
-					if (rayCrossesTriangle(meshXYZ, loopCHECKFACET, gridCOx(loopX), gridCOy(loopY)))
-						facetCROSSLIST.push_back(loopCHECKFACET);
+			std::vector<double> hits;
+			for (int face : possibleCROSSLIST) {
+				double depth;
+				if (rayIntersectionDepth(meshXYZ, face, gridCOx(loopX), gridCOy(loopY), meshZmin, depth))
+					hits.push_back(depth);
+			}
+			mergeCoincidentHits(hits, hitTolerance);
+			if (hits.size() % 2 != 0) {
+				correctionLIST.push_back(loopX);
+				correctionLIST.push_back(loopY);
+				continue;
+			}
+			for (size_t index = 0; index < hits.size(); index += 2) {
+				for (py::ssize_t z = 0; z < voxcountZ; ++z) {
+					if (hits[index] < gridCOz(z) && gridCOz(z) < hits[index + 1])
+						gridOUTPUT.mutable_at(loopX, loopY, z) = 1;
 				}
-
-				// - 3 - Find the z coordinate of the locations where the ray crosses each facet or vertex:
-				RowArrayX<double> gridCOzCROSS(facetCROSSLIST.size());
-				std::vector<double> insideL;
-				for (int index = 0; index < facetCROSSLIST.size(); index++) {
-					// Define the equation describing the plane of the facet
-					//    Ax + By + Cz + D = 0
-					//    where  A = y1(z2 - z3) + y2(z3 - z1) + y3(z1 - z2)
-					//           B = z1(x2 - x3) + z2(x3 - x1) + z3(x1 - x2)
-					//           C = x1(y2 - y3) + x2(y3 - y1) + x3(y1 - y2)
-					//           D = -x1(y2 z3 - y3 z2) - x2(y3 z1 - y1 z3) - x3(y1 z2 - y2 z1)
-					// For the x and y coordinates of the ray, solve these equations to find the z coordinate in this plane.
-					int loopFINDZ = facetCROSSLIST.at(index);
-					planecoA = meshXYZ.mutable_at(loopFINDZ, 1, 0) * (meshXYZ.mutable_at(loopFINDZ, 2, 1) - meshXYZ.mutable_at(loopFINDZ, 2, 2)) + meshXYZ.mutable_at(loopFINDZ, 1, 1) * (meshXYZ.mutable_at(loopFINDZ, 2, 2) - meshXYZ.mutable_at(loopFINDZ, 2, 0)) + meshXYZ.mutable_at(loopFINDZ, 1, 2) * (meshXYZ.mutable_at(loopFINDZ, 2, 0) - meshXYZ.mutable_at(loopFINDZ, 2, 1));
-					planecoB = meshXYZ.mutable_at(loopFINDZ, 2, 0) * (meshXYZ.mutable_at(loopFINDZ, 0, 1) - meshXYZ.mutable_at(loopFINDZ, 0, 2)) + meshXYZ.mutable_at(loopFINDZ, 2, 1) * (meshXYZ.mutable_at(loopFINDZ, 0, 2) - meshXYZ.mutable_at(loopFINDZ, 0, 0)) + meshXYZ.mutable_at(loopFINDZ, 2, 2) * (meshXYZ.mutable_at(loopFINDZ, 0, 0) - meshXYZ.mutable_at(loopFINDZ, 0, 1));
-					planecoC = meshXYZ.mutable_at(loopFINDZ, 0, 0) * (meshXYZ.mutable_at(loopFINDZ, 1, 1) - meshXYZ.mutable_at(loopFINDZ, 1, 2)) + meshXYZ.mutable_at(loopFINDZ, 0, 1) * (meshXYZ.mutable_at(loopFINDZ, 1, 2) - meshXYZ.mutable_at(loopFINDZ, 1, 0)) + meshXYZ.mutable_at(loopFINDZ, 0, 2) * (meshXYZ.mutable_at(loopFINDZ, 1, 0) - meshXYZ.mutable_at(loopFINDZ, 1, 1));
-					planecoD = -meshXYZ.mutable_at(loopFINDZ, 0, 0) * (meshXYZ.mutable_at(loopFINDZ, 1, 1) * meshXYZ.mutable_at(loopFINDZ, 2, 2) - meshXYZ.mutable_at(loopFINDZ, 1, 2) * meshXYZ.mutable_at(loopFINDZ, 2, 1)) - meshXYZ.mutable_at(loopFINDZ, 0, 1) * (meshXYZ.mutable_at(loopFINDZ, 1, 2) * meshXYZ.mutable_at(loopFINDZ, 2, 0) - meshXYZ.mutable_at(loopFINDZ, 1, 0) \
-						* meshXYZ.mutable_at(loopFINDZ, 2, 2)) - meshXYZ.mutable_at(loopFINDZ, 0, 2) * (meshXYZ.mutable_at(loopFINDZ, 1, 0) * meshXYZ.mutable_at(loopFINDZ, 2, 1) - meshXYZ.mutable_at(loopFINDZ, 1, 1) * meshXYZ.mutable_at(loopFINDZ, 2, 0));
-
-					if (abs(planecoC) < 1e-14)
-						planecoC = 0.0;
-					gridCOzCROSS(index) = (-planecoD - planecoA * gridCOx(loopX) - planecoB * gridCOy(loopY)) / planecoC;
-					if ((gridCOzCROSS(index) >= meshZmin - 1e-12) && (gridCOzCROSS(index) <= meshZmax + 1e-12))
-						insideL.push_back(gridCOzCROSS(index));
-				}
-				//Remove values of gridCOzCROSS which are outside of the mesh limits(including a 1e-12 margin for error).
-				std::sort(insideL.begin(), insideL.end());
-				gridCOzCROSS = Eigen::Map<RowArrayX<double>>(insideL.data(),insideL.size());
-				//Round gridCOzCROSS to remove any rounding errors, and take only the unique values :
-				gridCOzCROSS = (gridCOzCROSS * 1e12).round() / 1e12;
-				int aa = std::unique(gridCOzCROSS.data(), gridCOzCROSS.data() + gridCOzCROSS.size()) - gridCOzCROSS.data();
-				gridCOzCROSS = Map<RowArrayX<double>>(gridCOzCROSS.data(),aa);
-
-				// - 4 - Label as being inside the mesh all the voxels that the ray passes through after crossing one facet before crossing another facet
-				// Only rays which cross an even number of facets are voxelised
-
-				if ((gridCOzCROSS.size() % 2) == 0) {
-					for (int loopASSIGN = 1; loopASSIGN < (gridCOzCROSS.size() / 2.0) + 1; loopASSIGN++) {
-						for (int sz = 0; sz < gridCOz.size(); sz++) {
-							if ((gridCOz(sz) > gridCOzCROSS(2*loopASSIGN - 2)) && (gridCOz(sz) < gridCOzCROSS(2*loopASSIGN - 1)))
-								gridOUTPUT.mutable_at(loopX, loopY, sz) = 1;
-						}
-					}
-				}
-
-				// Remaining rays which meet the mesh in some way are not voxelised, but are labelled for correction later.
-				else if (gridCOzCROSS.size() > 0) {
-					correctionLIST.push_back(loopX);
-					correctionLIST.push_back(loopY);
-				}
-
 			}
 
 		}
@@ -472,6 +453,10 @@ py::array_t<int> Voxel::_VOXELISE_Parallel(py::array_t<double> gx, py::array_t<d
 	meshYmax = meshXYZ[py::make_tuple(py::slice(0, N, 1), 1, py::slice(0, 3, 1))].attr("max")().cast<double>();
 	meshZmin = meshXYZ[py::make_tuple(py::slice(0, N, 1), 2, py::slice(0, 3, 1))].attr("min")().cast<double>();
 	meshZmax = meshXYZ[py::make_tuple(py::slice(0, N, 1), 2, py::slice(0, 3, 1))].attr("max")().cast<double>();
+
+	// Grid samples and hits use the same local depth, independent of world position.
+	gridCOz -= meshZmin;
+	const double hitTolerance = 32 * std::numeric_limits<double>::epsilon() * (meshZmax - meshZmin);
 
 	// Identify the min and max x, y coordinates(pixels) of the mesh :
 	py::ssize_t meshXminp, meshXmaxp, meshYminp, meshYmaxp, temp, row;
@@ -522,67 +507,26 @@ py::array_t<int> Voxel::_VOXELISE_Parallel(py::array_t<double> gx, py::array_t<d
 					possibleCROSSLIST.push_back(possibleCROSSLISTy.at(j));
 			}
 
-			if (possibleCROSSLIST.size() > 0) {
-				// -2 - For each facet, check if the ray really does cross the facet rather than just passing it close - by:
-				std::vector<int> facetCROSSLIST;
-				// - 2 - Check for crossed facets
-				//Only continue the analysis if some nearby facets were actually identified
-				double planecoA, planecoB, planecoC, planecoD;
-				for (int loopCHECKFACET : possibleCROSSLIST) {
-					if (rayCrossesTriangle(meshXYZ, loopCHECKFACET, gridCOx(loopX), gridCOy(loopY)))
-						facetCROSSLIST.push_back(loopCHECKFACET);
-				}
-
-				// - 3 - Find the z coordinate of the locations where the ray crosses each facet or vertex:
-				RowArrayX<double> gridCOzCROSS(facetCROSSLIST.size());
-				std::vector<double> insideL;
-				for (int index = 0; index < facetCROSSLIST.size(); index++) {
-					// Define the equation describing the plane of the facet
-					//    Ax + By + Cz + D = 0
-					//    where  A = y1(z2 - z3) + y2(z3 - z1) + y3(z1 - z2)
-					//           B = z1(x2 - x3) + z2(x3 - x1) + z3(x1 - x2)
-					//           C = x1(y2 - y3) + x2(y3 - y1) + x3(y1 - y2)
-					//           D = -x1(y2 z3 - y3 z2) - x2(y3 z1 - y1 z3) - x3(y1 z2 - y2 z1)
-					// For the x and y coordinates of the ray, solve these equations to find the z coordinate in this plane.
-					int loopFINDZ = facetCROSSLIST.at(index);
-					planecoA = meshXYZ.mutable_at(loopFINDZ, 1, 0) * (meshXYZ.mutable_at(loopFINDZ, 2, 1) - meshXYZ.mutable_at(loopFINDZ, 2, 2)) + meshXYZ.mutable_at(loopFINDZ, 1, 1) * (meshXYZ.mutable_at(loopFINDZ, 2, 2) - meshXYZ.mutable_at(loopFINDZ, 2, 0)) + meshXYZ.mutable_at(loopFINDZ, 1, 2) * (meshXYZ.mutable_at(loopFINDZ, 2, 0) - meshXYZ.mutable_at(loopFINDZ, 2, 1));
-					planecoB = meshXYZ.mutable_at(loopFINDZ, 2, 0) * (meshXYZ.mutable_at(loopFINDZ, 0, 1) - meshXYZ.mutable_at(loopFINDZ, 0, 2)) + meshXYZ.mutable_at(loopFINDZ, 2, 1) * (meshXYZ.mutable_at(loopFINDZ, 0, 2) - meshXYZ.mutable_at(loopFINDZ, 0, 0)) + meshXYZ.mutable_at(loopFINDZ, 2, 2) * (meshXYZ.mutable_at(loopFINDZ, 0, 0) - meshXYZ.mutable_at(loopFINDZ, 0, 1));
-					planecoC = meshXYZ.mutable_at(loopFINDZ, 0, 0) * (meshXYZ.mutable_at(loopFINDZ, 1, 1) - meshXYZ.mutable_at(loopFINDZ, 1, 2)) + meshXYZ.mutable_at(loopFINDZ, 0, 1) * (meshXYZ.mutable_at(loopFINDZ, 1, 2) - meshXYZ.mutable_at(loopFINDZ, 1, 0)) + meshXYZ.mutable_at(loopFINDZ, 0, 2) * (meshXYZ.mutable_at(loopFINDZ, 1, 0) - meshXYZ.mutable_at(loopFINDZ, 1, 1));
-					planecoD = -meshXYZ.mutable_at(loopFINDZ, 0, 0) * (meshXYZ.mutable_at(loopFINDZ, 1, 1) * meshXYZ.mutable_at(loopFINDZ, 2, 2) - meshXYZ.mutable_at(loopFINDZ, 1, 2) * meshXYZ.mutable_at(loopFINDZ, 2, 1)) - meshXYZ.mutable_at(loopFINDZ, 0, 1) * (meshXYZ.mutable_at(loopFINDZ, 1, 2) * meshXYZ.mutable_at(loopFINDZ, 2, 0) - meshXYZ.mutable_at(loopFINDZ, 1, 0) \
-						* meshXYZ.mutable_at(loopFINDZ, 2, 2)) - meshXYZ.mutable_at(loopFINDZ, 0, 2) * (meshXYZ.mutable_at(loopFINDZ, 1, 0) * meshXYZ.mutable_at(loopFINDZ, 2, 1) - meshXYZ.mutable_at(loopFINDZ, 1, 1) * meshXYZ.mutable_at(loopFINDZ, 2, 0));
-
-					if (abs(planecoC) < 1e-14)
-						planecoC = 0.0;
-					gridCOzCROSS(index) = (-planecoD - planecoA * gridCOx(loopX) - planecoB * gridCOy(loopY)) / planecoC;
-					if ((gridCOzCROSS(index) >= meshZmin - 1e-12) && (gridCOzCROSS(index) <= meshZmax + 1e-12))
-						insideL.push_back(gridCOzCROSS(index));
-				}
-				//Remove values of gridCOzCROSS which are outside of the mesh limits(including a 1e-12 margin for error).
-				std::sort(insideL.begin(), insideL.end());
-				gridCOzCROSS = Eigen::Map<RowArrayX<double>>(insideL.data(), insideL.size());
-				//Round gridCOzCROSS to remove any rounding errors, and take only the unique values :
-				gridCOzCROSS = (gridCOzCROSS * 1e12).round() / 1e12;
-				int aa = std::unique(gridCOzCROSS.data(), gridCOzCROSS.data() + gridCOzCROSS.size()) - gridCOzCROSS.data();
-				gridCOzCROSS = Map<RowArrayX<double>>(gridCOzCROSS.data(), aa);
-
-				// - 4 - Label as being inside the mesh all the voxels that the ray passes through after crossing one facet before crossing another facet
-				// Only rays which cross an even number of facets are voxelised
-
-				if ((gridCOzCROSS.size() % 2) == 0) {
-					for (int loopASSIGN = 1; loopASSIGN < (gridCOzCROSS.size() / 2.0) + 1; loopASSIGN++) {
-						for (int sz = 0; sz < gridCOz.size(); sz++) {
-							if ((gridCOz(sz) > gridCOzCROSS(2 * loopASSIGN - 2)) && (gridCOz(sz) < gridCOzCROSS(2 * loopASSIGN - 1)))
-								gridOUTPUT.mutable_at(loopX, loopY, sz) = 1;
-						}
-					}
-				}
-
-				// Remaining rays which meet the mesh in some way are not voxelised, but are labelled for correction later.
-				else if (gridCOzCROSS.size() > 0) {
+			std::vector<double> hits;
+			for (int face : possibleCROSSLIST) {
+				double depth;
+				if (rayIntersectionDepth(meshXYZ, face, gridCOx(loopX), gridCOy(loopY), meshZmin, depth))
+					hits.push_back(depth);
+			}
+			mergeCoincidentHits(hits, hitTolerance);
+			if (hits.size() % 2 != 0) {
+#pragma omp critical
+				{
 					correctionLIST.push_back(loopX);
 					correctionLIST.push_back(loopY);
 				}
-
+				continue;
+			}
+			for (size_t index = 0; index < hits.size(); index += 2) {
+				for (py::ssize_t z = 0; z < voxcountZ; ++z) {
+					if (hits[index] < gridCOz(z) && gridCOz(z) < hits[index + 1])
+						gridOUTPUT.mutable_at(loopX, loopY, z) = 1;
+				}
 			}
 
 		}

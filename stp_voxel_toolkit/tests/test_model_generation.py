@@ -70,6 +70,37 @@ class GenerationTests(unittest.TestCase):
                     grid = grid[..., 0]
                 np.testing.assert_array_equal(grid, expected)
 
+    def test_translated_through_hole_stays_empty(self):
+        from gui import pvoxel, voxel
+
+        outer = [(0, 0), (6, 0), (6, 6), (0, 6)]
+        inner = [(2, 2), (4, 2), (4, 4), (2, 4)]
+        quads = []
+        for i in range(4):
+            j = (i + 1) % 4
+            a, b, c, d = outer[i], outer[j], inner[j], inner[i]
+            quads.extend([
+                [(*a, 0), (*b, 0), (*c, 0), (*d, 0)],
+                [(*a, 3), (*d, 3), (*c, 3), (*b, 3)],
+                [(*a, 0), (*a, 3), (*b, 3), (*b, 0)],
+                [(*d, 0), (*c, 0), (*c, 3), (*d, 3)],
+            ])
+        triangles = np.array([np.array(quad)[list(face)] for quad in quads
+                              for face in ((0, 1, 2), (0, 2, 3))], dtype=float).transpose(0, 2, 1)
+        expected = np.ones((6, 6, 3), dtype=bool)
+        expected[2:4, 2:4, :] = False
+        for offset in ((0., 0., 0.), (470.7470878, 14210.70039, 25.4),
+                       (12_345_678.9, -23_456_789.1, 34_567_890.1234)):
+            translated = triangles + np.asarray(offset)[None, :, None]
+            bounds = np.stack([translated.min(axis=(0, 2)), translated.max(axis=(0, 2))])
+            for backend, parallel in ((pvoxel, False), (voxel, False), (voxel, True)):
+                for ray in ("x", "y", "z", "xyz"):
+                    with self.subTest(offset=offset, backend=backend.__name__, parallel=parallel, ray=ray), \
+                            contextlib.redirect_stdout(io.StringIO()):
+                        grid = backend.Voxel(*expected.shape).VOXELISE(
+                            translated, ray=ray, parallel=parallel, bounds=bounds)
+                        np.testing.assert_array_equal(np.asarray(grid).reshape(expected.shape), expected)
+
     def run_count_button(self, app, button):
         with patch.object(app, "_begin_task") as begin, patch("gui.messagebox.showerror") as error:
             button.invoke()
